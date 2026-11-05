@@ -25,6 +25,7 @@ enum class EventType {
     EVENT_HIT,               // 攻击命中
     EVENT_TAKE_DAMAGE,       // 受到伤害结算后
     EVENT_SHIELD_BROKEN,     // 护盾被击破（护盾消失时触发）
+    EVENT_SHIELD_ABSORBED,   // 护盾吸收红伤（actor=攻击方，target=持盾方，amount=吸收量）
     EVENT_ENTER_STAGE,       // 上场
     EVENT_SWAP,              // 换宠
     EVENT_OPPONENT_DEFEATED, // 击败对手

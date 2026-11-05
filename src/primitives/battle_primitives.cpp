@@ -1073,6 +1073,10 @@ void deal_damage(BattleContext* ctx, int target, int amount,
     if (broken > 0) {
         ctx->event_center_.emit(BattleEvent{EventType::EVENT_SHIELD_BROKEN, actor, target});
     }
+    if (remaining < amount) {
+        ctx->event_center_.emit(
+            BattleEvent{EventType::EVENT_SHIELD_ABSORBED, actor, target, amount - remaining});
+    }
     if (remaining <= 0) {
         return;  // 护盾完全挡下
     }

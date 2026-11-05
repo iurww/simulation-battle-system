@@ -66,6 +66,7 @@ const char* event_type_name(int event_type) {
         case EventType::EVENT_HIT: return "EVENT_HIT";
         case EventType::EVENT_TAKE_DAMAGE: return "EVENT_TAKE_DAMAGE";
         case EventType::EVENT_SHIELD_BROKEN: return "EVENT_SHIELD_BROKEN";
+        case EventType::EVENT_SHIELD_ABSORBED: return "EVENT_SHIELD_ABSORBED";
         case EventType::EVENT_ENTER_STAGE: return "EVENT_ENTER_STAGE";
         case EventType::EVENT_SWAP: return "EVENT_SWAP";
         case EventType::EVENT_OPPONENT_DEFEATED: return "EVENT_OPPONENT_DEFEATED";
