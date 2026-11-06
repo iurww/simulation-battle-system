@@ -31,6 +31,33 @@ class ShieldBank {
 public:
     static constexpr int kMaxShields = 8;
 
+    // **按来源的扣减台账**（2026-11-06，技能侧第十九轮）：absorb/consume 可选填，
+    // 调用方据此逐笔 emit EVENT_SHIELD_CONSUMED（grant_id = 该笔 source_id）——
+    // "终阶源盾下 N 次被激活/被消耗"（1691）这类**只认自己那一笔**的条款需要来源，
+    // 而 `broken_count` 只告诉"破了几笔"。固定容量数组，无堆分配。
+    struct ConsumeRecord {
+        int source_id = 0;
+        int consumed = 0;
+    };
+    struct ConsumeLog {
+        std::array<ConsumeRecord, kMaxShields> items{};
+        int count = 0;
+        void add(int source_id, int consumed) {
+            if (consumed <= 0) {
+                return;
+            }
+            for (int i = 0; i < count; ++i) {
+                if (items[i].source_id == source_id) {
+                    items[i].consumed += consumed;   // 同一笔多段合并
+                    return;
+                }
+            }
+            if (count < kMaxShields) {
+                items[count++] = ConsumeRecord{source_id, consumed};
+            }
+        }
+    };
+
     // **魂印/专属盾的约定优先级** —— 高于一切普通来源（普通盾从 0 起往上排）。
     // 用法：魂印赋予的"登场盾"用这个优先级登记，于是与其他护盾**叠加时优先被消耗**。
     //
@@ -44,23 +71,24 @@ public:
     static constexpr int kSoulShieldPriority = 1000;
 
     /** 吸收 damage，从最高优先级开始扣；返回穿透（护盾没挡完的部分）。 */
-    int absorb(int damage, int* broken_count = nullptr) {
-        return absorb_impl(damage, 0, broken_count);
+    int absorb(int damage, int* broken_count = nullptr, ConsumeLog* log = nullptr) {
+        return absorb_impl(damage, 0, broken_count, log);
     }
 
     /** 吸收 damage（带**承伤乘区**：每点护盾等效抵挡 (100+pct)/100 点伤害，
      *  封邪之嶂「每有1层印记提升护盾承伤值提升10%」用，2026-09-24 精灵王线 K2）。
      *  护盾的 quantity 记账仍是**真实点数**：等效抵挡的量换算回真实扣减。 */
-    int absorb_with_bonus(int damage, int bonus_pct, int* broken_count = nullptr) {
-        return absorb_impl(damage, bonus_pct, broken_count);
+    int absorb_with_bonus(int damage, int bonus_pct, int* broken_count = nullptr,
+                          ConsumeLog* log = nullptr) {
+        return absorb_impl(damage, bonus_pct, broken_count, log);
     }
 
     /** **主动消耗**（资源化，2026-09-24 精灵王线 K2）：
      *  沧岚「消耗自身的护盾值」/ 混地「消耗自身的全部护盾并附加等量百分比伤害」用。
      *  从最高优先级开始拿，拿满 requested 或拿空为止；被拿空的每条记一次破盾
      *  （调用方负责 emit EVENT_SHIELD_BROKEN——"以此法消耗的护盾视为被击破"）。
-     *  返回实际消耗的点数。 */
-    int consume(int requested, int* broken_count = nullptr) {
+     *  返回实际消耗的点数。`log` 可选：逐来源扣减台账（见 ConsumeLog）。 */
+    int consume(int requested, int* broken_count = nullptr, ConsumeLog* log = nullptr) {
         int consumed = 0;
         int broken = 0;
         while (consumed < requested && count_ > 0) {
@@ -72,6 +100,9 @@ public:
             const int take = std::min(requested - consumed, s.quantity);
             s.quantity -= take;
             consumed += take;
+            if (log != nullptr) {
+                log->add(s.source_id, take);
+            }
             if (s.quantity <= 0) {
                 remove_at(best);
                 ++broken;
@@ -150,7 +181,8 @@ private:
 
     // absorb 的统一实现：bonus_pct>0 时每条护盾的**等效抵挡容量** = quantity×(100+pct)/100，
     // quantity 按等效消耗换算回真实点数扣（见 absorb_with_bonus 注释）。
-    int absorb_impl(int damage, int bonus_pct, int* broken_count) {
+    // `log`（可选）逐笔记录 (source_id, 真实扣减点数)，供调用方发"按来源的被消耗"事件。
+    int absorb_impl(int damage, int bonus_pct, int* broken_count, ConsumeLog* log) {
         int broken = 0;
         while (damage > 0 && count_ > 0) {
             const int best = find_highest_priority_index();
@@ -158,16 +190,24 @@ private:
                 break;
             }
             Shield& s = slots_[best];
+            const int source_id = s.source_id;
+            const int quantity_before = s.quantity;
             const long long effective =
                 static_cast<long long>(s.quantity) * (100 + bonus_pct) / 100;
+            int absorbed = 0;
             if (effective > damage) {
-                s.quantity -= static_cast<int>(
+                absorbed = static_cast<int>(
                     static_cast<long long>(damage) * 100 / (100 + bonus_pct));
+                s.quantity -= absorbed;
                 damage = 0;
             } else {
                 damage -= static_cast<int>(effective);
+                absorbed = quantity_before;
                 ++broken;
-                remove_at(best);
+                remove_at(best);   // ⚠️ remove_at 之后 `s` 引用失效，必须之前取好值
+            }
+            if (log != nullptr) {
+                log->add(source_id, absorbed);
             }
         }
         if (broken_count) {

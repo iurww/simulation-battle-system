@@ -163,6 +163,11 @@ void evaluate_battle_end(BattleContext* ctx) {
             }
         }
         if (!has_alive) {
+            // 2584 瀚宇星皇：可上场额外精灵仍可补位 → 不立即判负（真正上场在
+            // CHOOSE_AFTER_DEATH 里自动实体化）。无额外上场槽才终局。
+            if (ctx->count_deployable_extra_spirits(side) > 0) {
+                continue;
+            }
             ctx->finish_battle();
             return;
         }
@@ -352,7 +357,15 @@ Skills* resolve_replacement_skill(BattleContext* ctx, int robot_id) {
     const SkillReplaceSource* carriers[2] = {&ctx->pending_skill_replacement[robot_id],
                                              &ctx->ws.skill_effect_source[robot_id]};
     for (const SkillReplaceSource* src : carriers) {
-        if (src->active && src->slot >= 0 && src->slot < 5 && src->source_owner >= 0
+        if (!src->active) {
+            continue;
+        }
+        // 复制技能（457/1656）：按 id 构造的 Skills 优先于槽位（跨精灵/跨宠物复制，
+        // 槽位只保留来源语义供 executing_skill_slot 判第五技能等）。
+        if (src->external_skill != nullptr) {
+            return src->external_skill;
+        }
+        if (src->slot >= 0 && src->slot < 5 && src->source_owner >= 0
             && src->source_owner <= 1) {
             // 替换技能取自 source_owner 方**场上**精灵（跨精灵替换：艾欧丽娅=施放方第五技能）
             ElfPet& source_pet =
@@ -390,7 +403,14 @@ bool should_skip_action_flow(const BattleContext* ctx, int robot_id) {
     if (!ctx || robot_id < 0 || robot_id > 1) {
         return true;
     }
-    if (!is_skill_action(ctx, robot_id)) {
+    // 蓄力释放（官方效果 17，2026-11-06）：上一回合蓄力的技能在本回合自动释放——
+    // 即使玩家点了嗑药/换宠/空操作，主流程也必须走到 resolve_skill_execution 去消费
+    // pending（那里会把 roundChoice 重定向到 pending.slot）。放在"操作类型"判定之前。
+    // ⚠️ 死亡/控制仍优先：被控时 pending 保留到下一回合（见下面两条）。
+    const bool charge_release =
+        ctx->pending_charged_skill[robot_id].active
+        && ctx->pending_charged_skill[robot_id].charge_round < ctx->roundCount;
+    if (!is_skill_action(ctx, robot_id) && !charge_release) {
         return true;  // CHOOSE_PET/USE_MEDICINE 在 OPERATION_CHOOSE_SKILL_MEDICAMENT
                       // 收到时已同步应用（perform_switch + EVENT_SWAP / robot.use_medicine），
                       // 此处主流程（BEFORE_SKILL_HIT → ... → AFTER_ACTION）无技能可执行，跳过。
@@ -467,15 +487,121 @@ int consume_selected_skill_pp(BattleContext* ctx, int robot_id) {
     return consumed;
 }
 
+// 技能效果表里是否含指定效果 id（复制技能 457/1656、蓄力 17 的执行期识别）。
+// 数据驱动：不依赖 native 侧效果登记表，内核只看加载后的 rawEffectRecords。
+static bool skill_has_effect(const Skills& skill, int effect_id) {
+    for (const auto& record : skill.rawEffectRecords) {
+        if (record.effect_id == effect_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 复制类技能的来源模式：0=不复制，457=复制对手最近释放，1656=复制对手当回合。
+static int skill_copy_mode(const Skills& skill) {
+    for (const auto& record : skill.rawEffectRecords) {
+        if (record.effect_id == 457) {
+            return 457;
+        }
+        if (record.effect_id == 1656) {
+            return 1656;
+        }
+    }
+    return 0;
+}
+
 void resolve_skill_execution(BattleContext* ctx, int robot_id, State trigger_state) {
     if (!ctx || robot_id < 0 || robot_id > 1) {
         return;
+    }
+
+    // ── 蓄力释放（官方效果 17"1回合等待，次回合攻击"，2026-11-06）─────────────────
+    // 上一回合蓄力的技能在本回合自动释放：把 roundChoice 重定向到 pending.slot，
+    // 并抑制 PP 二次扣除（蓄力当回合的 AFTER_ACTION 已扣过一次）。
+    bool releasing_charge = false;
+    {
+        auto& charge = ctx->pending_charged_skill[robot_id];
+        if (charge.active && charge.charge_round < ctx->roundCount) {
+            if (charge.slot >= 0 && charge.slot < 5) {
+                ctx->roundChoice[robot_id][0] =
+                    static_cast<int>(BattleFsm::ActionType::SELECT_SKILL);
+                ctx->roundChoice[robot_id][1] = charge.slot;
+                ctx->ws.skill_pp_cost_consumed[robot_id] = true;
+                ctx->last_charged_release_round[robot_id] = ctx->roundCount;
+                releasing_charge = true;
+            }
+            charge = BattleContext::PendingChargedSkill{};
+        }
     }
 
     const int skill_index = resolve_selected_skill_index(ctx, robot_id);
     if (skill_index < 0) {
         write_skill_resolution(ctx, robot_id, SkillExecResult::SKILL_INVALID, SkillResolutionFlags{false, false});
         return;
+    }
+
+    // 玩家**点选**的技能（复制/蓄力的来源判据；替换后的执行技能另算）。
+    Skills* chosen =
+        &ctx->seerRobot[robot_id].elfPets[ctx->on_stage[robot_id]].skills[skill_index];
+
+    // ── 蓄力首回合：识别点选技能含 effect 17 → 记 pending，本回合不执行、不注册效果、
+    //    不结算伤害（"等待"）；PP 仍由 AFTER_ACTION 正常扣除。
+    //    释放当回合（releasing_charge）或刚释放过的同一回合不再蓄力。
+    if (!releasing_charge
+        && ctx->last_charged_release_round[robot_id] != ctx->roundCount
+        && skill_has_effect(*chosen, 17)) {
+        auto& charge = ctx->pending_charged_skill[robot_id];
+        charge.active = true;
+        charge.slot = skill_index;
+        charge.target = 1 - robot_id;
+        charge.charge_round = ctx->roundCount;
+        write_skill_resolution(ctx, robot_id, SkillExecResult::SKILL_INVALID,
+                               SkillResolutionFlags{false, false});
+        return;
+    }
+
+    // ── 复制技能（457：对手最近释放；1656：对手当回合释放）────────────────────
+    // 在 query_usage **之前**注入 pending_skill_replacement（external_skill 指向按 id
+    // 构造的 Skills），本次执行即按复制技能结算（威力/系别/类别/命中/效果分支全覆盖）。
+    // 复制者**本体**的分支（如 1656 的两条惩罚子句、极致模仿的 3 回合窗口）在 execute
+    // 之后用手动 register_owned_branches 补注册，保证"复制 + 自身效果"都在。
+    bool copied = false;
+    {
+        const int copy_mode = skill_copy_mode(*chosen);
+        if (copy_mode != 0) {
+            const int opp = 1 - robot_id;
+            int source_id = 0;
+            int source_slot = 0;
+            if (copy_mode == 457) {
+                source_id = ctx->last_used_skill[opp].skill_id;
+                if (source_id > 0) {
+                    const ElfPet& opp_pet =
+                        ctx->seerRobot[opp].elfPets[ctx->on_stage[opp]];
+                    for (int slot = 0; slot < 5; ++slot) {
+                        if (opp_pet.skills[slot].id == source_id) {
+                            source_slot = slot;
+                            break;
+                        }
+                    }
+                }
+            } else {  // 1656：对手本回合点选的技能
+                if (ctx->roundChoice[opp][0]
+                    == static_cast<int>(BattleFsm::ActionType::SELECT_SKILL)) {
+                    const int slot = ctx->roundChoice[opp][1];
+                    if (slot >= 0 && slot < 5) {
+                        source_slot = slot;
+                        source_id = ctx->seerRobot[opp]
+                                        .elfPets[ctx->on_stage[opp]]
+                                        .skills[slot]
+                                        .id;
+                    }
+                }
+            }
+            if (source_id > 0) {
+                copied = ctx->install_copied_skill(robot_id, source_id, source_slot);
+            }
+        }
     }
 
     // 技能替换（如艾欧丽娅"骑士对决"）：执行用的技能对象可能指向替补技能，
@@ -487,6 +613,13 @@ void resolve_skill_execution(BattleContext* ctx, int robot_id, State trigger_sta
         return;
     }
     Skills& skill = *executing;
+    // 本系加成（STAB）系别：复制生效时材质化为**执行技能**的系别（普通技能清 valid，
+    // 伤害公式回退 skill.element —— 行为不变）。见 battleWorkspace.h。
+    ctx->ws.stab_element_override_valid[robot_id] = copied && (executing != chosen);
+    if (ctx->ws.stab_element_override_valid[robot_id]) {
+        ctx->ws.stab_element_override[robot_id][0] = skill.element[0];
+        ctx->ws.stab_element_override[robot_id][1] = skill.element[1];
+    }
     // 技能威力视图层：本次攻击的威力打底物化到 ws，效果（SKILL_EFFECT 时点）可改，
     // ATTACK_DAMAGE 阶段 calculateDamage 从 ws 读最终值（见 battleWorkspace.h）。
     // ⚠️ 用 `materialize()` 而**不是** `=`：物化是引擎打底，不算"效果改威力"，
@@ -530,6 +663,16 @@ void resolve_skill_execution(BattleContext* ctx, int robot_id, State trigger_sta
     ctx->ws.skill_type_view[robot_id] = static_cast<int>(skill.type);
     const auto [result, flags] = skill.execute(ctx, robot_id, trigger_state);
     write_skill_resolution(ctx, robot_id, result, flags);
+    // 复制技能：把**点选技能自己**的 HIT 分支也注册一遍。执行期已被换成复制技能，
+    // 但复制者本体效果属于本次使用（1656 惩罚、457 复制者的其它窗口…），不能丢。
+    // 无论复制技能命中与否都注册（复制是效果本身，官方未要求命中才复制）。
+    if (copied && executing != chosen) {
+        SkillResolutionFlags owner_flags = flags;
+        owner_flags.registerSkillEffects = true;
+        chosen->register_owned_branches(ctx, robot_id, SkillExecResult::HIT, owner_flags);
+    }
+    // 对手最近释放技能（457 数据源）：记**实际执行**的技能 id（复制生效时即复制目标）。
+    ctx->last_used_skill[robot_id] = BattleContext::LastUsedSkill{skill.id, ctx->roundCount};
     // 变威力标记清零：`execute()` 里的**强制执行置 0**（query_usage ②.0）是引擎行为不是效果改写，
     // 连同上面的物化一起在这里清掉。此后 SKILL_EFFECT / ATTACK_DAMAGE 桶里的任何写入都算
     // "效果改了威力/连击数" → ATTACK_DAMAGE 收尾重算第二次。每次技能执行清一次 → 不跨技能泄漏。
@@ -778,11 +921,20 @@ void apply_crit_defense_break(BattleContext* ctx, int attacker_id) {
     if (!ctx || attacker_id < 0 || attacker_id > 1 || !ctx->crit_happened[attacker_id]) {
         return;
     }
-    const Skills* executing = resolve_executing_skill(ctx, attacker_id);
-    if (!executing) {
-        return;
+    // 用**类别视图**（ws.skill_type_view，resolve_skill_execution 物化的实际执行技能类别）：
+    // 复制技能（457/1656）在 pending 消费后 resolve_executing_skill 会回退到点选的原技能，
+    // 直接读 executing->type 会把破防打错（破物防/特防）。普通路径两者一致。
+    const int type_view = ctx->ws.skill_type_view[attacker_id];
+    int type = type_view;
+    if (type_view < static_cast<int>(SkillType::Physical)
+        || type_view > static_cast<int>(SkillType::Attribute)) {
+        const Skills* fallback = resolve_executing_skill(ctx, attacker_id);
+        if (!fallback) {
+            return;
+        }
+        type = static_cast<int>(fallback->type);
     }
-    crit_defense_break(ctx, 1 - attacker_id, static_cast<int>(executing->type));
+    crit_defense_break(ctx, 1 - attacker_id, type);
 }
 
 // 变威力：**推翻第一次伤害计算，重算第二次，第二次覆盖第一次**（用户 2026-09-14 拍板落地）。
@@ -890,6 +1042,10 @@ void apply_resolved_damage(BattleContext* ctx) {
 // 两条出口共用（正常出口 / 技能无效出口），区别只在之前有没有跑 ATTACK_DAMAGE 时点桶。
 void finish_attack_damage(BattleContext* ctx, int attacker_id) {
     apply_variable_power_recalc(ctx, attacker_id);
+    // 星皇之怒二段（术语 406）：本次额外攻击"不会被其他效果响应"——事件已在
+    // EventCenter::emit 入口静音；受击后的**直接钩子**（逐段钩子/雷解/瞬杀/顽强）
+    // 不属于伤害提升，也不该响应。伤害管线仍照跑（"拥有原本技能所有的伤害提升效果"）。
+    const bool respond_to_hit = !ctx->event_center_.mute_emissions;
     // 「攻击技能无法造成伤害」票（effect 1090 族，2026-09-21 口径）：在伤害管线**之前**
     // 强制归零——护盾/护罩不消耗（它们还没介入）、裸伤台账记 0（雷解这类"造成伤害后"
     // 族不触发）。命中效果失效那半边走 ③层（resolve_skill_execution 里物化
@@ -917,7 +1073,8 @@ void finish_attack_damage(BattleContext* ctx, int attacker_id) {
     //   用后即焚（一次攻击一批）。
     if (ctx->ws.combo_hit_hook[attacker_id]) {
         const int hits = std::max(1, ctx->resolvedDamage.hitCount);
-        if (ctx->resolvedDamage.final > 0 && ctx->resolvedDamage.defenderId >= 0
+        if (respond_to_hit && ctx->resolvedDamage.final > 0
+            && ctx->resolvedDamage.defenderId >= 0
             && ctx->resolvedDamage.defenderId <= 1) {
             for (int hit_index = 1; hit_index <= hits; ++hit_index) {
                 ctx->ws.combo_hit_hook[attacker_id](ctx, hit_index);
@@ -933,7 +1090,8 @@ void finish_attack_damage(BattleContext* ctx, int attacker_id) {
     // ⚠️ 附的是**真伤** → 不吃护盾/护罩/抗性，也**不被臣服拦**（臣服只拦红伤/粉伤，
     //    官方与用户 2026-09-18 口径：真伤拦不住）——`deal_damage(TRUE)` 天然如此。
     // ⚠️ 末尾再判一次归零后的存活：防御方已被打死者不再补一段（避免多出一条归因）。
-    if (ctx->has_active_abnormal_status(
+    if (respond_to_hit
+        && ctx->has_active_abnormal_status(
             attacker_id, static_cast<int>(AbnormalStatusId::ThunderRelease))) {
         const int dealt = ctx->ws.raw_attack_damage[attacker_id];
         const int victim = 1 - attacker_id;
@@ -947,10 +1105,13 @@ void finish_attack_damage(BattleContext* ctx, int attacker_id) {
     // 通用特性·瞬杀 1-5 星：红伤**结算完之后**强制体力归零（用户 2026-09-15 实测口径；
     // 走 force_hp_to_zero 原语。犀牛式回血挂 EVENT_TAKE_DAMAGE、drain 在状态桶之后
     // → 回血晚于归零）。0 星的"条件式红伤拉高"在管线的 TRAIT_REPLACE（链首）。
-    trait_instant_kill_zero_hook(ctx, attacker_id);
     // 通用特性·顽强/回神：**瞬杀归零之后**的存活判定（用户 2026-09-16 口径："看先后顺序
     // 定实际效果，不要动不动就短路"）——先归零，再由本钩把 0 体力抬回。
-    trait_survive_lethal_hook(ctx, 1 - attacker_id);
+    // 星皇之怒二段不响应（respond_to_hit=false）。
+    if (respond_to_hit) {
+        trait_instant_kill_zero_hook(ctx, attacker_id);
+        trait_survive_lethal_hook(ctx, 1 - attacker_id);
+    }
 }
 
 // 技能无效（盔/威/封属）的伤害出口 —— effect 2501「技能无效时，重新进行伤害结算且…」的落点。
@@ -1013,6 +1174,134 @@ void run_invalid_skill_damage_hooks(BattleContext* ctx, int attacker_id) {
         }
     }
 }
+
+// ================================================================
+// 星皇之怒二段（术语 406，2026-11-06）——"以技能 50% 的威力额外进行 1 次攻击"
+// ================================================================
+//
+// 官方术语（glossary 406）：「以技能50%的威力额外进行1次攻击并执行技能对应的星皇之怒效果，
+// 本次攻击拥有原本技能所有的伤害提升效果且不会被其他效果响应，体力因此归0的对手无法触发
+// 任何效果」。
+//
+// 为什么必须是内核原语（不能拿"上次伤害的 50%"近似）：
+//   · 要**重新**调用伤害公式（威力按原技能当前有效威力 × pct）、重新掷命中/暴击/连击，
+//     而不是对上一次 `resolvedDamage.final` 做除法（那会沿用上一次的暴击/浮动/减伤结果）；
+//   · 要复用**本次技能**的伤害提升（ws 视图 / 增减伤管线 / 次数型增伤），但不注册技能效果
+//     分支、不发 EVENT_SKILL_USED、不计技能使用序号、不扣 PP（"并非又用一次技能"）；
+//   · "不会被其他效果响应"：伤害结算期间 EventCenter 静音（受击/破盾/异常等 watcher 全不
+//     投递），并给被打死的目标打上当回合死亡效果压制（silent_death_round）。
+//
+// 调用方：1095/1097/1098 的星皇之怒额外行动节点。返回 false = 未命中/无红伤（属性技能、
+// 威力 0、miss）；调用方不需要据此改星皇之怒的子效果（子效果与二段命中无关）。
+// 实现放匿名命名空间（取用 FSM 内部 stage/finish）；对外入口是同 TU 末尾的
+// `execute_extra_skill_attack` 转发（必须有外部链接，native 效果层要调）。
+bool execute_extra_skill_attack_impl(BattleContext* ctx, int owner, int power_percent) {
+    if (!ctx || owner < 0 || owner > 1 || power_percent <= 0) {
+        return false;
+    }
+    Skills* skill = resolve_executing_skill(ctx, owner);
+    if (!skill) {
+        return false;
+    }
+    // 属性技能没有红伤（1095 的瀚空之门就是属性技能：只跑星皇之怒子效果）。
+    if (skill->type == SkillType::Attribute) {
+        return false;
+    }
+    // 威力取**本次技能当前有效威力**（ws 视图；SKILL_EFFECT 的变威力/增威力已在其上），
+    // 缺失时回退面板威力。50% 向下取整。
+    int base_power = static_cast<int>(ctx->ws.skill_power_view[owner]);
+    if (base_power < 0) {
+        base_power = skill->power;
+    }
+    const int extra_power = base_power * power_percent / 100;
+    if (extra_power <= 0) {
+        return false;
+    }
+
+    // ---- 保存本次主动行动的 ws 视图（二段结算完恢复，避免污染后续时点）----
+    const int saved_power = static_cast<int>(ctx->ws.skill_power_view[owner]);
+    const int saved_combo = static_cast<int>(ctx->ws.combo_view[owner]);
+    const int saved_elem[2] = {ctx->ws.skill_element_view[owner][0],
+                               ctx->ws.skill_element_view[owner][1]};
+    const int saved_type = ctx->ws.skill_type_view[owner];
+    const bool saved_crit = ctx->crit_happened[owner];
+    const BattleWorkspace::AttackCredential saved_cred = ctx->ws.attack_credential[owner];
+    const bool saved_hit_invalid = ctx->ws.hit_invalid_detected[owner];
+    const int saved_hit_invalid_mode = ctx->ws.hit_invalid_mode[owner];
+    const bool saved_hit_invalid_zero = ctx->ws.hit_invalid_zero_damage[owner];
+    const SkillExecResult saved_result = ctx->ws.skill_exec_result[owner];
+    const SkillResolutionFlags saved_flags = ctx->ws.skill_resolution_flags[owner];
+    const bool saved_ready = ctx->ws.skill_resolution_ready[owner];
+    const int saved_stab[2] = {ctx->ws.stab_element_override[owner][0],
+                               ctx->ws.stab_element_override[owner][1]};
+    const bool saved_stab_valid = ctx->ws.stab_element_override_valid[owner];
+    auto saved_resolver = ctx->ws.combo_count_resolver[owner];
+    auto saved_hit_hook = ctx->ws.combo_hit_hook[owner];
+
+    // ---- 重掷命中/暴击（不走盔/威/封属/命中失效门，不消费拦截，不发事件）----
+    bool crit = false;
+    const bool hit = skill->roll_extra_attack(ctx, owner, &crit);
+    if (!hit) {
+        return false;
+    }
+
+    ctx->ws.skill_power_view[owner].materialize(extra_power);
+    // 连击：**重新掷**（"重算连击"）——与一次技能使用同源（技能连击区间）。
+    ctx->ws.combo_view[owner].materialize(skill->roll_combo_count());
+    ctx->ws.skill_element_view[owner][0] = skill->element[0];
+    ctx->ws.skill_element_view[owner][1] = skill->element[1];
+    ctx->ws.skill_type_view[owner] = static_cast<int>(skill->type);
+    ctx->crit_happened[owner] = crit;
+    ctx->ws.combo_count_resolver[owner] = nullptr;
+    ctx->ws.combo_hit_hook[owner] = nullptr;
+    // 二段不消费/不响应拦截与命中失效标记：清掉视图，避免 finish 的 kFullNull 误归零。
+    ctx->ws.hit_invalid_detected[owner] = false;
+    ctx->ws.hit_invalid_zero_damage[owner] = false;
+
+    // 伤害结算：stage（公式）→ finish（变威力重算/管线/落地）。EventCenter 静音。
+    struct EmissionMuteGuard {
+        EventCenter& center;
+        bool previous;
+        explicit EmissionMuteGuard(EventCenter& c)
+            : center(c), previous(c.mute_emissions) { center.mute_emissions = true; }
+        ~EmissionMuteGuard() { center.mute_emissions = previous; }
+    } mute(ctx->event_center_);
+    stage_simple_attack_damage(ctx, owner);
+    // 暴击破防与普通攻击同点：第一次公式之后、变威力重算之前（二段也重掷了暴击）。
+    apply_crit_defense_break(ctx, owner);
+    finish_attack_damage(ctx, owner);
+
+    const int defender = 1 - owner;
+    if (ctx->getPet(defender).hp <= 0) {
+        // "体力因此归0的对手无法触发任何效果"：压制目标方当回合的死亡监听与被击败时点桶
+        // （见 EventCenter::silent_death_round / execute_registered_actions）。
+        ctx->event_center_.silent_death_round[defender] = ctx->roundCount;
+    }
+
+    // ---- 恢复主动行动的视图 ----
+    ctx->ws.skill_power_view[owner].materialize(saved_power);
+    ctx->ws.skill_power_view[owner].consume();
+    ctx->ws.combo_view[owner].materialize(saved_combo);
+    ctx->ws.combo_view[owner].consume();
+    ctx->ws.skill_element_view[owner][0] = saved_elem[0];
+    ctx->ws.skill_element_view[owner][1] = saved_elem[1];
+    ctx->ws.skill_type_view[owner] = saved_type;
+    ctx->crit_happened[owner] = saved_crit;
+    ctx->ws.attack_credential[owner] = saved_cred;
+    ctx->ws.hit_invalid_detected[owner] = saved_hit_invalid;
+    ctx->ws.hit_invalid_mode[owner] = saved_hit_invalid_mode;
+    ctx->ws.hit_invalid_zero_damage[owner] = saved_hit_invalid_zero;
+    ctx->ws.skill_exec_result[owner] = saved_result;
+    ctx->ws.skill_resolution_flags[owner] = saved_flags;
+    ctx->ws.skill_resolution_ready[owner] = saved_ready;
+    ctx->ws.stab_element_override[owner][0] = saved_stab[0];
+    ctx->ws.stab_element_override[owner][1] = saved_stab[1];
+    ctx->ws.stab_element_override_valid[owner] = saved_stab_valid;
+    ctx->ws.combo_count_resolver[owner] = std::move(saved_resolver);
+    ctx->ws.combo_hit_hook[owner] = std::move(saved_hit_hook);
+    return true;
+}
+
 
 int resolve_pet_max_hp(const ElfPet& pet) {
     int max_hp = pet.numericalBase[NumericalPropertyIndex::HP];
@@ -1145,6 +1434,13 @@ void settle_staged_action_start_abnormal_damage(BattleContext* ctx, int robot_id
 }
 
 } // namespace
+
+// 星皇之怒二段（术语 406）的**外部入口**：匿名命名空间里的实现取用 FSM 内部
+// stage/finish 原语；native 效果层（batch_status_1/2、batch_modifiers_1）通过
+// battleFsm.h 的声明调这里。声明与定义必须同链接域。
+bool execute_extra_skill_attack(BattleContext* ctx, int owner, int power_percent) {
+    return execute_extra_skill_attack_impl(ctx, owner, power_percent);
+}
 
 BattleFsm::BattleFsm(bool enable_debug)
     : id_debug(enable_debug) {
@@ -1469,6 +1765,11 @@ void BattleFsm::General_Handler(BattleContext* battleContext, int robotId) {
 
 void BattleFsm::handle_GameStart(BattleContext* battleContext) {
     log("Game Start.");
+    // native 侧战斗开始扩展挂载（2581 团体精灵主/副位模型等）。此时 BattleRuntime
+    // 已把 PetInput.mainPosition 等写入 plugin_storage，晚于 init_battle。
+    if (BattleStartExtraHook hook = battle_start_extra_hook_slot()) {
+        hook(battleContext);
+    }
     battleContext->execute_registered_actions(-1, State::GAME_START);
     battleContext->generateState();
 }
@@ -1713,9 +2014,17 @@ void BattleFsm::handle_BattleRoundStart(BattleContext* battleContext) {
     //   "回合开始时魂印断回合 vs 回合开始时魂印免断续上"的房主先手交互
     //   （语料《机制解析—免断》：魔灵王式每回合开始续 1 回合免断，房主侧枫眠式
     //   断回合先结算就能断掉它——角色位决定胜负，与操作速度无关）。
-    battleContext->execute_registered_actions(battleContext->host_side,
+    // ★ 2341 赛博共振器「己方的回合开始效果先制+1」：开启方在整个 ROUND_START 时点
+    //   先结算自己的回合开始效果（覆盖角色序；双方都开启时保持角色序）。
+    int first_round_start_side = battleContext->host_side;
+    int second_round_start_side = battleContext->challenger_side();
+    if (battleContext->round_start_priority[second_round_start_side]
+        && !battleContext->round_start_priority[first_round_start_side]) {
+        std::swap(first_round_start_side, second_round_start_side);
+    }
+    battleContext->execute_registered_actions(first_round_start_side,
                                               State::BATTLE_ROUND_START);
-    battleContext->execute_registered_actions(battleContext->challenger_side(),
+    battleContext->execute_registered_actions(second_round_start_side,
                                               State::BATTLE_ROUND_START);
     battleContext->generateState();
 }
@@ -1749,6 +2058,9 @@ void BattleFsm::handle_BattleFirstMoveRight(BattleContext* battleContext) {
         // 先制效果失效"）：与束缚同语义、独立来源——效果侧按条件重写 ws，此处统一清零。
         if (battleContext->ws.priority_nullified[side]) {
             battleContext->ws.preemptive_level[side] = 0;
+        } else if (battleContext->ws.priority_nullify_positive_only[side]) {
+            battleContext->ws.preemptive_level[side] =
+                std::min(0, battleContext->ws.preemptive_level[side]);
         }
         if (battleContext->has_active_abnormal_status(
                 side, static_cast<int>(AbnormalStatusId::Overclock))) {
@@ -1908,6 +2220,17 @@ void BattleFsm::handle_BattleFirstAttackDamage(BattleContext* battleContext) {
     const int first_mover_id = resolve_first_mover_id(battleContext);
     // 裸伤台账：每次攻击尝试从 0 开始（被盔/被威的无效出口不会写入 → 读方拿到 0 而不是上一击的残留）
     battleContext->ws.raw_attack_damage[first_mover_id] = 0;
+    // 蓄力等待回合（官方效果 17）：resolve 已记录 pending 并跳过主流程 —— 本回合不结算
+    // 任何伤害，也不走无效出口钩子（那不是"技能无效"，是"还没出手"）。
+    {
+        const auto& charge = battleContext->pending_charged_skill[first_mover_id];
+        if (charge.active && charge.charge_round == battleContext->roundCount) {
+            clear_damage_snapshot(battleContext->pendingDamage);
+            clear_damage_snapshot(battleContext->resolvedDamage);
+            battleContext->generateState();
+            return;
+        }
+    }
     if (!battleContext->ws.skill_resolution_flags[first_mover_id].allowAttackDamagePipeline) {
         clear_damage_snapshot(battleContext->pendingDamage);
         clear_damage_snapshot(battleContext->resolvedDamage);
@@ -2052,6 +2375,16 @@ void BattleFsm::handle_BattleSecondAttackDamage(BattleContext* battleContext) {
     const int second_mover_id = resolve_second_mover_id(battleContext);
     // 裸伤台账：每次攻击尝试从 0 开始（同先手方）
     battleContext->ws.raw_attack_damage[second_mover_id] = 0;
+    // 蓄力等待回合（官方效果 17）：同先手方——本回合不结算伤害、不走无效出口钩子。
+    {
+        const auto& charge = battleContext->pending_charged_skill[second_mover_id];
+        if (charge.active && charge.charge_round == battleContext->roundCount) {
+            clear_damage_snapshot(battleContext->pendingDamage);
+            clear_damage_snapshot(battleContext->resolvedDamage);
+            battleContext->generateState();
+            return;
+        }
+    }
     if (!battleContext->ws.skill_resolution_flags[second_mover_id].allowAttackDamagePipeline) {
         log("Second mover's skill does not allow attack damage pipeline, skipping damage stage.");
         clear_damage_snapshot(battleContext->pendingDamage);
@@ -2258,6 +2591,41 @@ void BattleFsm::handle_ChooseAfterDeath(BattleContext* battleContext) {
     //   ⚠️ D2 根修（heal 封闭）+ D5 终局旗已把全灭/治疗两类逆转堵死；本守卫现在只在
     //   "非终局死亡被复活取消补位"这一正当路径可达——它就是该情形的正确续跑，不是活锁。
     //   判据必须与 need_input() / BATTLE_AFTER_DEFEATED 同口径（hp <= 0）。
+    // ★ 2584 瀚宇星皇「额外精灵加入出战背包」：若已方 6 槽再无存活精灵，但有
+    //   「可上场且未实体化」的额外精灵，则自动补位（等价真实参战模型）——把额外
+    //   精灵实体化到当前在场槽，随后按普通登场重基。有存活队友时仍由玩家正常选宠。
+    for (int side = 0; side < 2; ++side) {
+        const int slot = battleContext->on_stage[side];
+        if (slot < 0 || slot >= 6) {
+            continue;
+        }
+        if (battleContext->seerRobot[side].elfPets[slot].hp > 0) {
+            continue;
+        }
+        bool other_alive = false;
+        for (int i = 0; i < 6; ++i) {
+            if (i == slot) {
+                continue;
+            }
+            if (battleContext->seerRobot[side].elfPets[i].hp > 0) {
+                other_alive = true;
+                break;
+            }
+        }
+        if (other_alive || battleContext->count_deployable_extra_spirits(side) <= 0) {
+            continue;
+        }
+        battleContext->invalidate_on_stage_effects(side);
+        if (!deploy_extra_spirit(battleContext, side)) {
+            continue;
+        }
+        battleContext->clear_on_stage_abnormal_statuses(side);
+        battleContext->clear_ability_levels(side);
+        battleContext->sync_on_stage_trait(side);
+        battleContext->pet_death_notified[side][slot] = false;
+        sync_workspace_from_on_stage(battleContext);
+        log("Extra spirit deployed after death (effect 2584).");
+    }
     const bool dead0 = battleContext->seerRobot[0].elfPets[battleContext->on_stage[0]].hp <= 0;
     const bool dead1 = battleContext->seerRobot[1].elfPets[battleContext->on_stage[1]].hp <= 0;
     if (!dead0 && !dead1) {

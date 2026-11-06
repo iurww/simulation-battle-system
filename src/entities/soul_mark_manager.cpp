@@ -496,6 +496,20 @@ void SoulMark::retrigger_entrance(BattleContext* context, int owner, int host_sl
     }
 }
 
+void SoulMark::trigger_all_programs(BattleContext* context, int owner, int host_slot) {
+    if (!context || owner < 0 || owner > 1 || host_slot < 0 || host_slot > 5) return;
+    if (!has_program_) {
+        if (effect) effect(context, bind_soulmark_args(args, owner, host_slot));
+        return;
+    }
+    for (const auto& node : program_) {
+        if (node.boss_invalid && context->is_boss_challenge) continue;
+        if (node.effect_fn) {
+            node.effect_fn(context, bind_soulmark_args(args, owner, host_slot));
+        }
+    }
+}
+
 // SoulMark::deactivate_soul_mark — 离场/阵亡。
 // 只负责调用 on_exit 钩子做"桶外状态"的额外清理（如薇尔诗 2513 的全局抑制标记）。
 // 效果桶内的条目由调用方 invalidate_on_stage_effects 递增 epoch 作废（O(1)，无需遍历）。

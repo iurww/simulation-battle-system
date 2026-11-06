@@ -15,6 +15,7 @@
 
 #include <abnormal-system/abnormal-types.h>
 #include <effects/continuousEffect.h>
+#include <effects/extra_spirit_combat.h>
 #include <entities/elf-pet.h>
 #include <entities/mark.h>
 #include <fsm/battleContext.h>
@@ -104,7 +105,7 @@ void mark_first_exhaust_flag(BattleContext* ctx, int actor, int target) {
 //   对手（它现在就超上限了），这正是本函数"所有变更都经此"的价值所在。
 //   落地时需要给 RuleCenter 加一个条目族（不是 IMMUNE——没有次数/时点覆盖语义，
 //   生命周期随宿主在场），见 soul_lib/chaos_sorensen.cpp 文件头的同段说明。
-void write_ability_level(BattleContext* ctx, int target, int stat, int new_level) {
+void write_ability_level(BattleContext* ctx, int target, int stat, int new_level, int actor = -1) {
     const int delta = new_level - ctx->ability_levels[target][stat];
     if (delta == 0) {
         // 值没变（如 stat_change(delta=0)）→ 不写、不 emit。
@@ -114,7 +115,7 @@ void write_ability_level(BattleContext* ctx, int target, int stat, int new_level
     }
     ctx->ability_levels[target][stat] = new_level;
     ctx->ws.view_levels[target][stat] = new_level;
-    BattleEvent ev{EventType::EVENT_STAT_CHANGED, /*actor=*/-1, target, 0};
+    BattleEvent ev{EventType::EVENT_STAT_CHANGED, /*actor=*/actor, target, 0};
     ev.state = static_cast<int>(ctx->currentState);
     ev.stat_index = stat;
     ev.level_after = new_level;
@@ -242,8 +243,23 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
     //    被动毒"，而它们正是 Ancient/Raw 通道——闸门在这里是**比免疫链更外层**的东西
     //    （问的是"这次附加到底有没有发生"，不是"发生了会不会被挡"）。
     if (chance_pct >= 0) {
+        int declared = chance_pct;
+        if (actor >= 0 && actor <= 1 && ctx->anomaly_chance_add[actor] != 0
+            && (ctx->anomaly_chance_add_status[actor] < 0
+                || ctx->anomaly_chance_add_status[actor] == anomaly_id)
+            && (ctx->anomaly_chance_add_threshold[actor] < 0
+                || declared > ctx->anomaly_chance_add_threshold[actor])) {
+            declared = std::clamp(declared + ctx->anomaly_chance_add[actor], 0, 100);
+            ctx->anomaly_chance_add[actor] = 0;
+            ctx->anomaly_chance_add_threshold[actor] = -1;
+            ctx->anomaly_chance_add_status[actor] = -1;
+        }
+        BattleEvent attempt{EventType::EVENT_ANOMALY_ATTEMPT, actor, target, anomaly_id};
+        attempt.stat_index = declared;
+        ctx->event_center_.emit(attempt);
         const int final_pct = ctx->rule_center_.rewrite_anomaly_chance(
-            target, actor, chance_pct, ChanceTag::AnomalyAttach, source, ctx->roundCount);
+            target, actor, declared, ChanceTag::AnomalyAttach, source, ctx->roundCount,
+            anomaly_id);
         if (final_pct <= 0) {
             return ApplyAnomalyResult::ROLL_FAILED;
         }
@@ -312,8 +328,39 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
     // ⚠️ 古早施加（主动毒）也**无视异常抗性**（语料主动毒口径）→ Ancient 通道跳过。
     // 抗性成功：直写附加"免疫异常"异常(21, 2回合)——**击穿魂免**（不走免疫检查）；
     // 先走转化（攻击方可预置 conversion[target][21]=Y 把抵抗结果直接转成 Y）。
-    if (channel == AnomalyChannel::Modern && reflect_depth == 0
-        && pet.resistance.isResistantTo(anomaly_id)) {
+    if (channel == AnomalyChannel::Modern && reflect_depth == 0) {
+        int ignored_slot = -1;
+        int ignored_pct = 0;
+        int ignored_anomaly = 0;
+        bool ignored_is_control = false;
+        if (actor >= 0 && actor <= 1 && ctx->anomaly_resist_ignore_pct[actor] > 0) {
+            const int cap = ctx->anomaly_resist_ignore_pct[actor];
+            ctx->anomaly_resist_ignore_pct[actor] = 0;
+            for (int i = 0; i < kResistanceSlotCount && ignored_slot < 0; ++i) {
+                const auto c = pet.resistance.getControlSlot(i);
+                if (c.first == anomaly_id && c.second > 0 && c.second <= cap) {
+                    ignored_slot = i; ignored_pct = c.second; ignored_anomaly = c.first;
+                    ignored_is_control = true;
+                    pet.resistance.setControlSlot(i, c.first, 0);
+                }
+            }
+            for (int i = 0; i < kResistanceSlotCount && ignored_slot < 0; ++i) {
+                const auto u = pet.resistance.getUncontrolSlot(i);
+                if (u.first == anomaly_id && u.second > 0 && u.second <= cap) {
+                    ignored_slot = i; ignored_pct = u.second; ignored_anomaly = u.first;
+                    pet.resistance.setUncontrolSlot(i, u.first, 0);
+                }
+            }
+        }
+        const bool resisted = pet.resistance.isResistantTo(anomaly_id);
+        if (ignored_slot >= 0) {
+            if (ignored_is_control) {
+                pet.resistance.setControlSlot(ignored_slot, ignored_anomaly, ignored_pct);
+            } else {
+                pet.resistance.setUncontrolSlot(ignored_slot, ignored_anomaly, ignored_pct);
+            }
+        }
+        if (resisted) {
         const int resolved = resolve_anomaly_conversion(
             ctx, target, static_cast<int>(AbnormalStatusId::AbnormalImmunity));
         ctx->set_abnormal_status_end_round(target, resolved, ctx->roundCount + 2);
@@ -323,6 +370,7 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
         ctx->event_center_.emit(BattleEvent{EventType::EVENT_ANOMALY_RESISTED, actor, target,
                                             anomaly_id, static_cast<int>(ctx->currentState)});
         return ApplyAnomalyResult::RESISTED_BY_RESISTANCE;
+        }
     }
 
     // [5] 魂免（soul=true）—— 抗性判定失败后才查（官方优先级）。同样挡下后消费次数型。
@@ -858,6 +906,37 @@ int cure_anomalies(BattleContext* ctx, int target, const int* anomaly_ids, int c
     return cured;
 }
 
+int deal_off_field_pink_damage(BattleContext* ctx, int side, int slot, int amount,
+                               DamageKind kind, int actor) {
+    if (!ctx || side < 0 || side > 1 || slot < 0 || slot >= 6 || amount <= 0) return 0;
+    if (kind != DamageKind::FIXED && kind != DamageKind::PERCENT
+        && kind != DamageKind::PERCENT_VALUE) return 0;
+    if (slot == ctx->on_stage[side] || ctx->is_vanished(side, slot)) return 0;
+    ElfPet& pet = ctx->seerRobot[side].elfPets[slot];
+    if (pet.id < 0 || pet.hp <= 0) return 0;
+    if (ctx->off_field_stats_protected(side, slot)) return 0;
+    const int dealt = std::min(pet.hp, amount);
+    pet.hp -= dealt;
+    BattleEvent off_ev{EventType::EVENT_TAKE_DAMAGE, actor, side, dealt};
+    off_ev.damage_kind = static_cast<int>(kind);
+    off_ev.slot = slot;
+    ctx->event_center_.emit(off_ev);
+    if (pet.hp <= 0) {
+        pet.hp = 0;
+        defeat_pet(ctx, side, slot, actor, DefeatCause::DAMAGE);
+    }
+    return dealt;
+}
+
+bool force_hp_to_zero_at(BattleContext* ctx, int side, int slot, int actor) {
+    if (!ctx || side < 0 || side > 1 || slot < 0 || slot >= 6) return false;
+    ElfPet& pet = ctx->seerRobot[side].elfPets[slot];
+    if (pet.id < 0 || pet.hp <= 0) return false;
+    pet.hp = 0;
+    defeat_pet(ctx, side, slot, actor, DefeatCause::DAMAGE);
+    return true;
+}
+
 OffFieldTrueDamageResult deal_off_field_true_damage(BattleContext* ctx, int side, int slot,
                                                     int amount, int actor, int residue_floor) {
     if (!ctx || side < 0 || side > 1 || slot < 0 || slot > 5 || amount <= 0
@@ -878,7 +957,12 @@ OffFieldTrueDamageResult deal_off_field_true_damage(BattleContext* ctx, int side
         return OffFieldTrueDamageResult::PROTECTED;   // 保护规则不是抗性，真伤照旧被挡
     }
     const bool would_kill = pet.hp - amount <= residue_floor;
+    const int dealt = pet.hp - std::max(residue_floor, pet.hp - amount);
     pet.hp = std::max(residue_floor, pet.hp - amount);
+    BattleEvent off_ev{EventType::EVENT_TAKE_DAMAGE, actor, side, dealt};
+    off_ev.damage_kind = static_cast<int>(DamageKind::TRUE_DMG);
+    off_ev.slot = slot;
+    ctx->event_center_.emit(off_ev);
     if (pet.hp <= 0) {
         // 击杀走死亡漏斗：EVENT_DEATH + 拦截器（圣光灵神式场下复活照常响应）
         defeat_pet(ctx, side, slot, actor, DefeatCause::DAMAGE);
@@ -990,7 +1074,7 @@ static void run_pink_damage(BattleContext* ctx, int target, int amount,
 
     // 落血记录（弹伤族数据源）：粉伤档位照实记，读方按 kind 排除（粉伤斩杀不弹）。
     ctx->last_landed_hit[target][ctx->on_stage[target]] = {actor, actual_damage,
-                                                           static_cast<int>(kind), true};
+                                                           static_cast<int>(kind), ctx->roundCount, true};
     mark_first_exhaust_flag(ctx, actor, target);
 
     // 粉伤事件：**只有真的结算到本体（体力下降）才发**。
@@ -1064,14 +1148,22 @@ void deal_damage(BattleContext* ctx, int target, int amount,
     const bool ignore_bank = (actor >= 0 && actor <= 1 && ctx->ws.ignore_shield[actor]);
     int broken = 0;
     int remaining = amount;
+    ShieldBank::ConsumeLog shield_log;
     if (!ignore_bank && kind == DamageKind::NORMAL) {
         // 承伤乘区（精灵王线 K2）：封邪之嶂"每有1层印记护盾承伤值+10%"——
         // ws 每回合 reset，由混地魂印程序按层数重写（damage_add_pct 同套路）。
         remaining = pet.shield_bank_.absorb_with_bonus(
-            amount, ctx->ws.shield_absorb_bonus_pct[target], &broken);
+            amount, ctx->ws.shield_absorb_bonus_pct[target], &broken, &shield_log);
     }
     if (broken > 0) {
         ctx->event_center_.emit(BattleEvent{EventType::EVENT_SHIELD_BROKEN, actor, target});
+    }
+    // 逐来源的"护盾被消耗"（1691 族按来源计数）：grant_id = 该笔护盾的 source_id。
+    for (int i = 0; i < shield_log.count; ++i) {
+        BattleEvent ev{EventType::EVENT_SHIELD_CONSUMED, actor, target,
+                       shield_log.items[i].consumed};
+        ev.grant_id = shield_log.items[i].source_id;
+        ctx->event_center_.emit(ev);
     }
     if (remaining < amount) {
         ctx->event_center_.emit(
@@ -1083,6 +1175,9 @@ void deal_damage(BattleContext* ctx, int target, int amount,
 
     // 扣血
     const int hp_before = pet.hp;
+    const int dealt = std::min(pet.hp, remaining);
+    ctx->ws.damage_taken_round[target] += dealt;
+    if (kind == DamageKind::FIXED) ctx->ws.fixed_damage_taken_round[target] += dealt;
     pet.hp -= remaining;
     if (pet.hp < 0) {
         pet.hp = 0;
@@ -1100,7 +1195,7 @@ void deal_damage(BattleContext* ctx, int target, int amount,
         // **造成了多少红伤/属性直伤就全额反弹多少**（致死时以真伤全额反弹），不按剩余
         // 体力截断——记 remaining（护盾后全额伤害，过量击杀不缩水）。
         ctx->last_landed_hit[target][ctx->on_stage[target]] = {actor, remaining,
-                                                               static_cast<int>(kind), true};
+                                                               static_cast<int>(kind), ctx->roundCount, true};
         mark_first_exhaust_flag(ctx, actor, target);
     }
 
@@ -1314,6 +1409,29 @@ HpZeroResult force_hp_to_zero(BattleContext* ctx, int target, int actor) {
     return HpZeroResult::EXECUTED;
 }
 
+int consume_hp(BattleContext* ctx, int target, int amount, int actor) {
+    if (!ctx || target < 0 || target > 1 || amount <= 0) return 0;
+    ElfPet& pet = ctx->getPet(target);
+    const int before = pet.hp;
+    if (before <= 0) return 0;
+    const int actual = std::min(before, amount);
+    pet.hp = before - actual;
+    if (actor >= 0 && actor <= 1) {
+        ctx->last_damage_actor[target][ctx->on_stage[target]] = actor;
+    }
+    return actual;
+}
+
+int heal_off_field(BattleContext* ctx, int side, int slot, int amount) {
+    if (!ctx || side < 0 || side > 1 || slot < 0 || slot >= 6 || amount <= 0) return 0;
+    ElfPet& pet = ctx->seerRobot[side].elfPets[slot];
+    const int max_hp = pet.numericalBase[NumericalPropertyIndex::HP];
+    if (max_hp <= 0 || pet.hp <= 0) return 0;
+    const int before = pet.hp;
+    pet.hp = std::min(max_hp, before + amount);
+    return pet.hp - before;
+}
+
 int seal_skill(BattleContext* ctx, int source, int target, int effect_id, bool attribute,
                bool attack, int count, int duration_rounds, bool penetrable, int source_slot,
                EffectScope scope, bool hit_invalid, int chance_pct, bool consumed_when_pierced) {
@@ -1365,9 +1483,34 @@ int seal_skill(BattleContext* ctx, int source, int target, int effect_id, bool a
 }
 
 // ── PP 恢复（精灵王线 K7，2026-09-24）──
+int pp_reduce_off_field(BattleContext* ctx, int side, int pet_slot, int amount) {
+    if (!ctx || side < 0 || side > 1 || pet_slot < 0 || pet_slot >= 6 || amount <= 0) {
+        return 0;
+    }
+    ElfPet& pet = ctx->seerRobot[side].elfPets[pet_slot];
+    if (pet.id < 0 || pet.hp <= 0) return 0;
+    int total = 0;
+    for (int slot = 0; slot < static_cast<int>(pet.skills.size()); ++slot) {
+        Skills& skill = pet.skills[slot];
+        if (skill.id <= 0 || skill.pp <= 0) continue;
+        const int before = skill.pp;
+        skill.pp = std::max(0, skill.pp - amount);
+        total += before - skill.pp;
+        BattleEvent ev{EventType::EVENT_PP_REDUCED, /*actor=*/-1, side,
+                       /*amount=*/before, static_cast<int>(ctx->currentState),
+                       /*grant_id=*/-1, /*blocked=*/false, /*slot=*/slot};
+        ctx->event_center_.emit(ev);
+    }
+    return total;
+}
+
 int pp_restore_slot(BattleContext* ctx, int side, int pet_slot, int skill_slot) {
     if (!ctx || side < 0 || side > 1 || pet_slot < 0 || pet_slot > 5 || skill_slot < 0
         || skill_slot > 4) {
+        return 0;
+    }
+    // PP 恢复前置票（2539「对手无法通过技能恢复PP值」）：被封锁方一律不入账。
+    if (ctx->pp_restore_blocked[side]) {
         return 0;
     }
     Skills& skill = ctx->seerRobot[side].elfPets[pet_slot].skills[skill_slot];
@@ -1381,6 +1524,10 @@ int pp_restore_slot(BattleContext* ctx, int side, int pet_slot, int skill_slot) 
 
 int pp_restore_points(BattleContext* ctx, int target, int slot, int points) {
     if (!ctx || target < 0 || target > 1 || slot < 0 || slot > 4 || points <= 0) {
+        return 0;
+    }
+    // PP 恢复前置票（2539）：见 pp_restore_slot 同款注释。
+    if (ctx->pp_restore_blocked[target]) {
         return 0;
     }
     Skills& skill = ctx->getPet(target).skills[slot];
@@ -1405,6 +1552,14 @@ void hit_effect_invalid(BattleContext* ctx, int target, HitInvalidMode mode,
     // is_attribute_skill 决定挂哪一类——要"两种技能都失效"就调两次本原语。
     ctx->rule_center_.grant_hit_invalid(target, /*source_slot=*/-1, source_id, static_cast<int>(mode),
                                         count, is_attribute_skill);
+}
+
+void hit_effect_invalid_rounds(BattleContext* ctx, int target, HitInvalidMode mode,
+                               int rounds, bool is_attribute_skill, int source_id) {
+    if (!ctx || target < 0 || target > 1 || rounds <= 0) return;
+    ctx->rule_center_.grant_hit_invalid_rounds(target, -1, source_id,
+                                               static_cast<int>(mode), rounds,
+                                               is_attribute_skill);
 }
 
 StatChangeResult stat_change(BattleContext* ctx, int target, int stat, int delta) {
@@ -1460,7 +1615,14 @@ static int heal_impl(BattleContext* ctx, int target, int heal_amount) {
     // 封回血：本时点覆盖内封锁体力回复（位覆盖仿魂免——coverage 全置位=闭环恒封；
     // 只含部分时点=低级，未覆盖时点的恢复有效）。
     if (ctx->is_immune(target, ImmunityType::HEAL_BLOCK, ctx->currentState)) {
+        // 次数型封回血（“下 N 次恢复效果减少/无效”）命中一次要扣一次；
+        // 窗口/永久票 counts=0 时 consume_immune 不会注销窗口。
+        ctx->consume_immune(target, ImmunityType::HEAL_BLOCK, ctx->currentState);
         ctx->ws.last_heal_amount[target] = 0;
+        BattleEvent blocked{EventType::EVENT_HEAL_BLOCKED, /*actor=*/-1, target,
+                            /*amount=*/heal_amount, static_cast<int>(ctx->currentState)};
+        blocked.blocked = true;
+        ctx->event_center_.emit(blocked);
         return 0;
     }
     // 恢复效果修正%（正=提升，负=降低；封回血=-100 等价归零）。
@@ -1595,14 +1757,41 @@ int consume_shield(BattleContext* ctx, int target, int amount, int* broken_count
         return 0;
     }
     int broken = 0;
-    const int consumed = ctx->getPet(target).shield_bank_.consume(amount, &broken);
+    ShieldBank::ConsumeLog shield_log;
+    const int consumed = ctx->getPet(target).shield_bank_.consume(amount, &broken, &shield_log);
     for (int i = 0; i < broken; ++i) {
         ctx->event_center_.emit(BattleEvent{EventType::EVENT_SHIELD_BROKEN, -1, target});
+    }
+    for (int i = 0; i < shield_log.count; ++i) {
+        BattleEvent ev{EventType::EVENT_SHIELD_CONSUMED, -1, target,
+                       shield_log.items[i].consumed};
+        ev.grant_id = shield_log.items[i].source_id;
+        ctx->event_center_.emit(ev);
     }
     if (broken_count) {
         *broken_count = broken;
     }
     return consumed;
+}
+
+// 具名护盾入账 + "被激活"事件（1691 终阶源盾族，见头文件注释）。source_id 是条款
+// 唯一能过滤的键，刷新必须用同号（add 语义：容量未满就新开一笔，满则忽略——
+// 与 ShieldBank::add 完全一致，不在这里自造刷新语义）。
+int grant_shield(BattleContext* ctx, int target, int priority, int quantity, int source_id,
+                 int duration, int actor) {
+    if (!ctx || target < 0 || target > 1 || quantity <= 0) {
+        return 0;
+    }
+    ShieldBank& bank = ctx->getPet(target).shield_bank_;
+    const int before = bank.quantity_of(source_id);
+    bank.add(priority, quantity, source_id, duration);
+    const int granted = bank.quantity_of(source_id) - before;
+    if (granted > 0) {
+        BattleEvent ev{EventType::EVENT_SHIELD_GRANTED, actor, target, granted};
+        ev.grant_id = source_id;
+        ctx->event_center_.emit(ev);
+    }
+    return granted > 0 ? granted : 0;
 }
 
 int clear_stat_drops(BattleContext* ctx, int target) {
@@ -1750,7 +1939,7 @@ StatDropResult stat_drop(BattleContext* ctx, int target, int stat, int amount, i
         return StatDropResult::AT_FLOOR;  // 已到底，不越界
     }
     const int new_level = std::max(level - amount, -6);  // ② 不突破 -6（钳制）
-    write_ability_level(ctx, target, stat, new_level);   // 视图同步（伤害/先手权读它）+ emit
+    write_ability_level(ctx, target, stat, new_level, actor);   // 视图同步（伤害/先手权读它）+ emit
     return StatDropResult::SUCCESS;
 }
 
@@ -1874,6 +2063,41 @@ PpReduceResult pp_reduce(BattleContext* ctx, int target, int amount) {
     return changed ? PpReduceResult::SUCCESS : PpReduceResult::INVALID_PARAM;
 }
 
+PpReduceResult pp_reduce_slot(BattleContext* ctx, int target, int slot, int amount) {
+    if (!ctx || target < 0 || target > 1 || amount <= 0) return PpReduceResult::INVALID_PARAM;
+    ElfPet& pet = ctx->getPet(target);
+    if (slot < 0 || slot >= static_cast<int>(pet.skills.size())) return PpReduceResult::INVALID_PARAM;
+    Skills& skill = pet.skills[slot];
+    if (skill.pp == -1) return PpReduceResult::INVALID_PARAM;
+    const int before = skill.pp;
+    skill.pp = std::max(0, skill.pp - amount);
+    if (skill.pp == before) return PpReduceResult::INVALID_PARAM;
+    ctx->event_center_.emit(BattleEvent{
+        EventType::EVENT_PP_REDUCED, /*actor=*/-1, target, /*amount=*/before - skill.pp,
+        static_cast<int>(ctx->currentState), /*grant_id=*/-1, /*blocked=*/false, /*slot=*/slot});
+    return PpReduceResult::SUCCESS;
+}
+
+int pp_set_slot(BattleContext* ctx, int target, int slot, int value) {
+    if (!ctx || target < 0 || target > 1 || value < 0) return 0;
+    ElfPet& pet = ctx->getPet(target);
+    if (slot < 0 || slot >= static_cast<int>(pet.skills.size())) return 0;
+    Skills& skill = pet.skills[slot];
+    if (skill.pp == -1 || skill.maxPP <= 0) return 0;
+    const int before = skill.pp;
+    skill.pp = std::min(skill.maxPP, value);
+    // PP 恢复前置票（2539）：只拦"往上调"（恢复语义），下调/削 PP 照常。
+    if (ctx->pp_restore_blocked[target] && skill.pp > before) {
+        skill.pp = before;
+        return 0;
+    }
+    if (skill.pp == before) return 0;
+    ctx->event_center_.emit(BattleEvent{
+        EventType::EVENT_PP_REDUCED, /*actor=*/-1, target, std::abs(before - skill.pp),
+        static_cast<int>(ctx->currentState), /*grant_id=*/-1, /*blocked=*/false, /*slot=*/slot});
+    return skill.pp - before;
+}
+
 PpReduceResult pp_zero_slot(BattleContext* ctx, int target, int slot, int actor) {
     if (!ctx || target < 0 || target > 1 || slot < 0
         || slot >= static_cast<int>(ctx->getPet(target).skills.size())) {
@@ -1909,6 +2133,12 @@ PpReduceResult pp_zero_slot(BattleContext* ctx, int target, int slot, int actor)
 
 int pp_restore(BattleContext* ctx, int target, int amount, bool only_empty) {
     if (!ctx || target < 0 || target > 1 || amount <= 0) {
+        return 0;
+    }
+    // PP 恢复前置票（2539「对手无法通过技能恢复PP值」）：整侧封锁，逐槽都不入账。
+    // 收口在本原语（而不是效果侧）是唯一能覆盖技能/魂印/套装全部调用点的位置，
+    // 口径近似见 battleContext.h 的 `pp_restore_blocked` 注释。
+    if (ctx->pp_restore_blocked[target]) {
         return 0;
     }
     ElfPet& pet = ctx->getPet(target);
@@ -2130,15 +2360,21 @@ DefeatResult defeat_pet(BattleContext* ctx, int side, int slot, int actor, Defea
     // ⚠️ 消耗全部体力会跳过 sees_hp_consume=false 的条目——官方 idx=339：
     //    "所有的残留体力效果面对消耗体力效果，都不能免死，会被直接强制死亡"，
     //    而复活"只要触发就可以当回合不死"。两层可见性不同，故不能合成一个钩子。
-    for (const DeathInterceptor& ic : ctx->death_interceptors) {
-        if (!ic.fn) {
-            continue;
-        }
-        if (cause == DefeatCause::HP_CONSUME && !ic.sees_hp_consume) {
-            continue;
-        }
-        if (ic.fn(ctx, side, slot, actor, cause) && pet.hp > 0) {
-            return DefeatResult::INTERCEPTED;   // 拦下且已落地（hp 已写回 > 0）
+    // 星皇之怒二段（术语 406）：被二段归零的对手"无法触发任何效果"——当回合免死/复活
+    // 拦截器也不询问（EventCenter::silent_death_round 由 execute_extra_skill_attack 打标）。
+    const bool silent_death =
+        ctx->event_center_.silent_death_round[side] == ctx->roundCount;
+    if (!silent_death) {
+        for (const DeathInterceptor& ic : ctx->death_interceptors) {
+            if (!ic.fn) {
+                continue;
+            }
+            if (cause == DefeatCause::HP_CONSUME && !ic.sees_hp_consume) {
+                continue;
+            }
+            if (ic.fn(ctx, side, slot, actor, cause) && pet.hp > 0) {
+                return DefeatResult::INTERCEPTED;   // 拦下且已落地（hp 已写回 > 0）
+            }
         }
     }
     ctx->pet_death_notified[side][slot] = true;
@@ -2149,6 +2385,16 @@ DefeatResult defeat_pet(BattleContext* ctx, int side, int slot, int actor, Defea
     ev.slot = slot;
     ev.cause = static_cast<int>(cause);
     ctx->event_center_.emit(ev);
+    // 击败方事件：旧效果库（妖王/圣甲等）监听的是 EVENT_OPPONENT_DEFEATED，
+    // 语义 = 击杀方视角（actor=击杀方，target=倒下方）。此前全仓无发射点，
+    // 这些“击败后”效果实际永不触发；此处与 EVENT_DEATH 同步补发。
+    if (actor >= 0 && actor <= 1 && actor != side) {
+        BattleEvent defeated{EventType::EVENT_OPPONENT_DEFEATED, actor, side, 0};
+        defeated.state = static_cast<int>(ctx->currentState);
+        defeated.slot = slot;
+        defeated.cause = static_cast<int>(cause);
+        ctx->event_center_.emit(defeated);
+    }
     return DefeatResult::DEFEATED;
 }
 
@@ -2255,6 +2501,75 @@ void remove_death_interceptors(BattleContext* ctx, int source_effect_id) {
             v.end());
 }
 
+// ── 可上场额外精灵（2584）───────────────────────────────────────────────
+// 把 extra_spirits 条目实体化为真实 ElfPet。信息全部来自 ExtraSpirit::combat；
+// 传统额外精灵（combat==nullptr）不实体化，行为不变。
+bool materialize_extra_spirit(BattleContext* ctx, int side, int slot, int extra_index) {
+    if (!ctx || side < 0 || side > 1 || slot < 0 || slot >= 6) {
+        return false;
+    }
+    std::vector<ExtraSpirit>& list = ctx->extra_spirits[side];
+    if (extra_index < 0 || extra_index >= static_cast<int>(list.size())) {
+        return false;
+    }
+    ExtraSpirit& es = list[extra_index];
+    if (es.combat == nullptr || es.combat->pet_id <= 0
+        || es.state != ExtraSpiritState::ALIVE) {
+        return false;
+    }
+    ExtraSpiritCombatData& data = *es.combat;
+    std::array<Skills, 5> skills{
+        Skills(Skills::EmptyPetTag{}), Skills(Skills::EmptyPetTag{}),
+        Skills(Skills::EmptyPetTag{}), Skills(Skills::EmptyPetTag{}),
+        Skills(Skills::EmptyPetTag{})};
+    for (int i = 0; i < 5 && i < static_cast<int>(data.skills.size()); ++i) {
+        skills[i] = data.skills[i];
+    }
+    numerical_properties base{};
+    base[NumericalPropertyIndex::PHYSICAL_ATTACK] = data.stats[0];
+    base[NumericalPropertyIndex::SPECIAL_ATTACK] = data.stats[1];
+    base[NumericalPropertyIndex::DEFENSE] = data.stats[2];
+    base[NumericalPropertyIndex::SPECIAL_DEFENSE] = data.stats[3];
+    base[NumericalPropertyIndex::SPEED] = data.stats[4];
+    base[NumericalPropertyIndex::HP] = data.stats[5] > 0 ? data.stats[5] : data.max_hp;
+    const int max_hp = std::max(1, base[NumericalPropertyIndex::HP]);
+    const int hp = std::clamp(data.hp > 0 ? data.hp : max_hp, 1, max_hp);
+    ElfPet pet(data.pet_id, data.name, {data.element, data.element2}, 0, Gender::NONE,
+               SoulMark{}, CommonTrait{}, base, hp, 0, 0, false, skills);
+    ctx->seerRobot[side].elfPets[slot] = std::move(pet);
+    data.in_bag = true;
+    data.bag_slot = slot;
+    es.linked_slot = slot;
+    // 顶替已阵亡槽时复位死亡登记（旧宠已死，本槽现在由额外精灵接管）。
+    if (ctx->pet_death_notified[side][slot]) {
+        revive_pet(ctx, side, slot, hp);
+    }
+    return true;
+}
+
+bool deploy_extra_spirit(BattleContext* ctx, int side) {
+    if (!ctx || side < 0 || side > 1) {
+        return false;
+    }
+    const int slot = ctx->on_stage[side];
+    if (slot < 0 || slot >= 6) {
+        return false;
+    }
+    std::vector<ExtraSpirit>& list = ctx->extra_spirits[side];
+    for (int i = 0; i < static_cast<int>(list.size()); ++i) {
+        ExtraSpirit& es = list[i];
+        if (es.combat == nullptr || !es.combat->deployable || es.combat->in_bag
+            || es.state != ExtraSpiritState::ALIVE || es.combat->hp <= 0) {
+            continue;
+        }
+        if (!materialize_extra_spirit(ctx, side, slot, i)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 void sync_pending_deaths(BattleContext* ctx) {
     if (!ctx) {
         return;
@@ -2273,6 +2588,32 @@ void sync_pending_deaths(BattleContext* ctx) {
             }
             // 漏发的死亡（绕过原语的直写路径：咤连锁击杀场下宠、反弹伤害直写 hp-=n…）
             defeat_pet(ctx, side, slot, -1, DefeatCause::EFFECT);
+        }
+    }
+    // 2584 可上场额外精灵：回合完成时懒补全（旧登记只写 source_effect_id）并实体化到
+    // 空槽（"加入出战背包"，下一回合即可正常换宠/选招）。无空槽则等死后补位。
+    if (ExtraSpiritFiller filler = extra_spirit_filler_slot()) {
+        for (int side = 0; side < 2; ++side) {
+            for (ExtraSpirit& es : ctx->extra_spirits[side]) {
+                if (es.source_effect_id == 2584
+                    && (es.combat == nullptr || es.combat->pet_id == 0)) {
+                    filler(es);
+                }
+            }
+            for (int index = 0;
+                 index < static_cast<int>(ctx->extra_spirits[side].size()); ++index) {
+                ExtraSpirit& es = ctx->extra_spirits[side][index];
+                if (es.combat == nullptr || !es.combat->deployable || es.combat->in_bag
+                    || es.state != ExtraSpiritState::ALIVE || es.combat->hp <= 0) {
+                    continue;
+                }
+                for (int slot = 0; slot < 6; ++slot) {
+                    if (ctx->seerRobot[side].elfPets[slot].id < 0) {
+                        materialize_extra_spirit(ctx, side, slot, index);
+                        break;
+                    }
+                }
+            }
         }
     }
 }

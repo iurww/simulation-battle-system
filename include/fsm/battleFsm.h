@@ -115,4 +115,13 @@ private:
     void handle_Finished(BattleContext* battleContext);
 };
 
+// ================================================================
+// 星皇之怒二段（术语 406）：以本次技能 power_percent% 的威力额外进行 1 次攻击。
+// 重新掷命中/暴击/连击、复用本次技能的伤害提升，但**不**注册技能效果、不计技能使用、
+// 不扣 PP；结算期间事件静音，被此击归零的目标当回合死亡效果被压制。
+// 返回 true = 命中并完成一次伤害结算；false = 属性技能/威力 0/miss（调用方忽略即可）。
+// 实现在 src/fsm/battleFsm.cpp（需要 FSM 内部 stage/finish 原语）。
+// ================================================================
+bool execute_extra_skill_attack(BattleContext* ctx, int owner, int power_percent);
+
 #endif // BATTLEFSM_H

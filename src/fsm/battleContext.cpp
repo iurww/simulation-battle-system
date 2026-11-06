@@ -1,6 +1,7 @@
 #include <fsm/battleContext.h>
 #include <fsm/battleFsm.h>
 #include <entities/soul_mark_manager.h>
+#include <effects/effect.h>
 #include <primitives/battle_primitives.h>
 
 #include <algorithm>
@@ -195,6 +196,16 @@ void BattleContext::init_battle() {
     EffectFactory::getInstance().run_pre_battle_patches(this, PreBattlePhase::PANEL_SNAPSHOT);
     SoulMarkManager::getInstance().run_pre_battle_patches(this, PreBattlePhase::STAT_MODIFY);
     EffectFactory::getInstance().run_pre_battle_patches(this, PreBattlePhase::STAT_MODIFY);
+
+    // ── 宿主注册的"战斗开始扫描"（2026-11-06，技能侧第十九轮）──
+    // iconInherent「携带此技能时…」族在宿主自建输入（不走 Skills::loadSkills）时
+    // carryEffects 槽恒空，本表是等价入口（见 effects/effect.h 的 BattleStartScanFn 注释）。
+    // 放在全部面板改写之后：扫描函数装的是常驻时点节点/命中文物，读到的面板已是最终值。
+    for (BattleStartScanFn fn : battle_start_scan_fns()) {
+        if (fn != nullptr) {
+            fn(this);
+        }
+    }
 }
 
 void BattleContext::install_default_pink_mitigation() {
@@ -677,7 +688,8 @@ void BattleContext::install_default_damage_floor() {
                 if (!damage.isRed || damage.final < 0) {
                     return;   // 保底是红伤规则；负值留给后续阶段钳
                 }
-                const int floor_value = ctx->ws.damage_floor[damage.attackerId];
+                const int floor_value = std::max(ctx->ws.damage_floor[damage.attackerId],
+                                                 ctx->damage_floor_persistent[damage.attackerId]);
                 if (floor_value > 0 && damage.final < floor_value) {
                     damage.final = floor_value;
                 }
@@ -711,6 +723,19 @@ void BattleContext::install_default_damage_block() {
                     // 属性伤害不吃**常规**挡伤（用户 2026-09-18 口径，见 DamageSnapshot 注释）：
                     // "免疫下N次攻击伤害"票不响应它；但**系别条件性**抵挡（如岚"免疫非本系技能
                     // 伤害"）是插件自己注册的 BLOCK 条目，不看本标志、按 attribute_element 自行判。
+                    return;
+                }
+                // 「无视攻击免疫效果」凭证（699 / 2331 等）在**红伤 BLOCK 阶段**同样生效
+                // （2026-11-06，技能侧第十九轮）：凭证此前只穿过 RuleCenter 的 SEAL（盔/封属），
+                // 而"攻击免疫"的另一半是 `ImmunityType::DAMAGE` 免伤票 —— 不在这里让路，
+                // 「无视对手攻击免疫效果」就只穿了一半。凭证按"请求"物化（ws.attack_credential，
+                // 每回合 reset），这里**不消费票**（免伤票不因被穿而烧掉，与可穿盔的
+                // consumed_when_pierced=false 同口径），只记"确实穿到了"供 2331 判无视成功。
+                const int attacker = damage.attackerId;
+                if (attacker >= 0 && attacker <= 1
+                    && ctx->ws.attack_credential[attacker].ignore_attack_immunity
+                    && ctx->is_immune(defender, ImmunityType::DAMAGE, ctx->currentState)) {
+                    ctx->ws.attack_credential[attacker].pierced_attack_immunity = true;
                     return;
                 }
                 // 次数型免伤（"免疫下N次攻击伤害"）：纯查询命中才消费——非次数型（窗口/永久）
@@ -1028,14 +1053,42 @@ void BattleContext::execute_registered_actions(int robotId, State state) {
 
     // 「被击败效果失效」（event_center_.defeat_effects_suppressed，2026-09-22）：
     // 该方被压制时，它的"被击败时/被击败后"桶整体不执行 = 被击败效果无法触发。
+    // 星皇之怒二段（术语 406）：被二段打死的对手"无法触发任何效果"——silent_death_round
+    // 同口径压当回合（按回合号存，下一回合自然失配）。
     const bool defeated_suppressed =
-        event_center_.defeat_effects_suppressed[robotId] && is_defeated_timing_state(state);
+        (event_center_.defeat_effects_suppressed[robotId]
+         || event_center_.silent_death_round[robotId] == roundCount)
+        && is_defeated_timing_state(state);
 
     if (run_action_buckets && !defeated_suppressed) {
         // 魂印容器 → 套装容器 → 技能容器（官方口径：回合开始"先结算魂印，后结算套装"，
         // "造成伤害前"链套装节点同样在魂印之后；技能侧现状保持不变。见套装线设计文档）。
         soul_mark_effects.execute_at(state, robotId, this);
         suit_effects.execute_at(state, robotId, this);
+        // 本次在场技能效果台账（BattleContext::stay_skill_effects）：只记 SKILL_EFFECT 时点
+        // （构造 I~IV = 2149/2150/2151/2152 都注册在该时点；2153 从这里取"本次在场生效过"）。
+        // was_first 与 native is_first 同口径：读 ws.preemptive_right（NONE = 未结算 → 按
+        // 非先出手记）。被 epoch 作废/已过期的条目不执行，也不记。
+        if (state == State::BATTLE_FIRST_SKILL_EFFECT
+            || state == State::BATTLE_SECOND_SKILL_EFFECT) {
+            bool was_first = false;
+            if (ws.preemptive_right == PreemptiveRight::SEER_ROBOT_1) {
+                was_first = (robotId == 0);
+            } else if (ws.preemptive_right == PreemptiveRight::SEER_ROBOT_2) {
+                was_first = (robotId == 1);
+            }
+            // 只读遍历（const at 不会为不存在的桶插条目）。
+            const TimedBucket& skill_bucket = skills_effects;
+            for (const auto& entry : skill_bucket.at(state, robotId)) {
+                const ContinuousEffect* effect = entry.second.get();
+                if (effect == nullptr || effect->isExpired(roundCount)) continue;
+                if (effect->scope_ == EffectScope::ON_STAGE
+                    && effect->valid_id_ != round_effect_valid_id[robotId]) {
+                    continue;
+                }
+                record_stay_skill_effect(robotId, *effect->getEffect(), was_first);
+            }
+        }
         skills_effects.execute_at(state, robotId, this);
     }
     // 被动桶：不受动作流程守门；被击败压制同口径生效。

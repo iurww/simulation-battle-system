@@ -89,6 +89,9 @@ public:
     // 主体是当前效果归属 pet，天然落到她自己的登场效果（2026-09-20 官方实测口径）。
     void retrigger_entrance(BattleContext* context, int owner, int host_slot);
 
+    // 触发该魂印的全部程序节点（2463“阶段结束未用技能→触发自身专属特性所有效果”）。
+    void trigger_all_programs(BattleContext* context, int owner, int host_slot);
+
     // 在更新器桶登记"每回合刷新本魂印节点"的对象（回合边界执行，刷新 once 效果）。
     // 登场时调用一次即可（条目 source_id 去重，重复调用幂等）。
     void register_updater(BattleContext* context, int owner);

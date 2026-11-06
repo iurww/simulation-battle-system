@@ -80,7 +80,12 @@ class Calculation {
         // 本系加成（×1.5）：判据是**技能真实系别** vs 攻击方精灵系别。
         // ⚠️ "改系别只改克制、不改本系"是刻意的（改的是 `skill_element_view`，本系读 `skill.element`）；
         //    要"获得本系加成"的（effect 2490）走 `ws.force_involve` 这个显式开关，别去动 involve 的入参。
-        if (ws.force_involve[attacker] || involve(ws.view_elementalAttributes[attacker], skill.element)) {
+        // ★ 复制技能（457/1656）：执行期技能被换成按 id 构造的 Skills，而 stage_simple_attack_damage
+        //   在 pending 消费后只能拿到玩家点选的原技能 → 用 resolve_skill_execution 物化的
+        //   stab_element_override 兜底（valid=false 时行为与旧实现逐字节一致）。
+        const int* stab_element = ws.stab_element_override_valid[attacker]
+            ? ws.stab_element_override[attacker] : skill.element;
+        if (ws.force_involve[attacker] || involve(ws.view_elementalAttributes[attacker], stab_element)) {
             damage *= 1.5; // Elemental advantage
         }
         return damage;

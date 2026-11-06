@@ -29,8 +29,10 @@
 // ════════════════════════════════════════════════════════════════════════
 
 #include <functional>
+#include <memory>
 
 class BattleContext;
+struct ExtraSpiritCombatData;
 
 // 本次倒下的成因。拦截器按成因决定可见性（见上：消耗体力穿残留免死、不穿复活）。
 enum class DefeatCause {
@@ -80,9 +82,17 @@ struct ExtraSpirit {
     int element = 0;               // 系别 id（邪灵/金/玄…），供"剥离单系别"类效果查询
     ExtraSpiritState state = ExtraSpiritState::ALIVE;
     int source_effect_id = 0;      // 来源效果（咽咎尸骸 / 黑白龙…）
+    int identity = 0;              // 具名额外精灵身份（1=玄源之㡣 / 2=金祖之龍…）
     int source_side = -1;          // 归属方
     int linked_slot = -1;          // 关联本体槽（-1 = 无本体，如魂帝尸骸）
     // 本体死亡或被消逝**不影响**额外精灵（官方 idx=149 #6）——故本容器与 pet 解耦。
+
+    // ── 「可上场额外精灵」真实参战模型（2026-11-06，2584 瀚宇星皇）──────────
+    // 官方术语 70 说传统额外精灵"没有血量/PP/技能"；2584 是**加入出战背包**的
+    // 特例：它必须能被上场、能选招。参战数据（含 Skills 完整定义）放在
+    // effects/extra_spirit_combat.h，用指针持有以避开 spirit_lifecycle → skills 的
+    // include 环。传统额外精灵保持 nullptr —— 旧语义不变。
+    std::shared_ptr<ExtraSpiritCombatData> combat;
 };
 
 // 死亡拦截器：返回 true = 本次死亡被拦下。

@@ -266,4 +266,45 @@ private:
     EffectFactory& operator=(EffectFactory&&) = delete;
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 战斗开始扫描钩子（iconInherent「携带此技能时…」/「战斗开始时…」族）
+//
+// 为什么另立一张表（2026-11-06，技能侧第十九轮）：
+//   `EffectFactory::registerCarryEffect` 的槽位在 `Skills::carryEffects`，而该槽只在
+//   `Skills::loadSkills()`（查官方库）里装填。宿主用**自建输入**装配 Skills（不经
+//   loadSkills）时槽位恒空，携带钩子永远不跑。本表给宿主一条**不经 loadSkills** 的
+//   等价入口：宿主在战斗开始前注册扫描函数，`BattleContext::init_battle` 在携带扫描/
+//   战前魂印补丁之后逐个调用；扫描函数自己遍历 `seerRobot[*].elfPets[*].skills[*]
+//   .effectBranches` 找目标 effect id 并装常驻节点。
+//
+// 语义边界：
+//   · 每场战斗**一次**（BattleContext 构造期），此时 effectBranches/selection_effects_
+//     已装配完毕、plugin_storage 可写；
+//   · 不按存活/在场过滤（携带是 loadout 事实，效果体自判）；
+//   · 技能**替换后不重扫**（与 carryEffects 的既有约定一致；需要重扫的效果自己在
+//     替换点补装）；
+//   · header-only + inline：sim_core 与宿主静态库编进同一可执行文件，弱符号合并为
+//     一份表（内置插件经 dylib 加载时看不到本入口，也不该看到）。
+// ═══════════════════════════════════════════════════════════════════════════
+typedef void (*BattleStartScanFn)(BattleContext* ctx);
+
+inline std::vector<BattleStartScanFn>& battle_start_scan_fns() {
+    static std::vector<BattleStartScanFn> table;
+    return table;
+}
+
+// 注册扫描函数（返回 true 便于 static 初始化器写法）。
+inline bool add_battle_start_scan(BattleStartScanFn fn) {
+    if (fn == nullptr) {
+        return false;
+    }
+    battle_start_scan_fns().push_back(fn);
+    return true;
+}
+
+// 文件作用域静态注册器：`namespace { BattleStartScanRegistrar g(fn); }`
+struct BattleStartScanRegistrar {
+    explicit BattleStartScanRegistrar(BattleStartScanFn fn) { add_battle_start_scan(fn); }
+};
+
 #endif // EFFECT_H

@@ -22,6 +22,7 @@ enum class EventType {
     EVENT_DEATH,             // 精灵死亡
     EVENT_CONTROLLED,        // 控场异常施加成功
     EVENT_ANOMALY_APPLIED,   // 任意异常施加成功
+    EVENT_ANOMALY_ATTEMPT,   // 任意异常附加尝试（掷骰前；amount=异常 id，stat_index=申报概率）
     EVENT_HIT,               // 攻击命中
     EVENT_TAKE_DAMAGE,       // 受到伤害结算后
     EVENT_SHIELD_BROKEN,     // 护盾被击破（护盾消失时触发）
@@ -133,6 +134,7 @@ enum class EventType {
     // ⚠️ 吸取（drain_hp）的回血半边也走 heal_impl → 会发本事件（actor=-1）：
     //    吸取 = "恢复了自己的体力"，蛊按 target 过滤天然不会误触。
     EVENT_HEAL_RESTORED,
+    EVENT_HEAL_BLOCKED,   // 恢复被 HEAL_BLOCK/封回血拦截（amount=原恢复量，供“按原恢复量粉伤”）
     // **能力提升被消除/吸取（带归因）**（clear_stat_boosts_as / transfer_stat_boosts_as
     // 专用，2026-09-24 精灵王线 K4）：target = 被消除方、actor = 动手方（消除/吸取技能
     // 的施放方）、amount = 实际消除/搬走的项数（0 不发——"消强未成功"不触发后续）。
@@ -157,6 +159,19 @@ enum class EventType {
     // 挡的）；本条只在**免疫票命中**时发——4830 鲨鱼辣椒「对手免疫固定伤害则消除
     // 回合类」的检测点。注意次数型票挡一段只发一次；窗口/永久票每段都发。
     EVENT_DAMAGE_IMMUNED,
+    // **具名护盾被激活 / 被消耗**（2026-11-06，技能侧第十九轮；1691「终阶源盾下{0}次被
+    // 激活或被消耗…」族）。护盾按 `ShieldBank` 的 source_id 区分来源，两个事件都带
+    // grant_id = **该笔护盾的 source_id**，调用方可只认自己那一笔（不能读总量）。
+    //   · EVENT_SHIELD_GRANTED ：护盾**入账**（本笔被创建/刷新到非零）= 官方"被激活"；
+    //     actor = 授予方、target = 持盾方、amount = 本次入账点数。
+    //   · EVENT_SHIELD_CONSUMED：护盾**被消耗**（主动 consume，或红伤吸收后归零），
+    //     actor = 动手方（红伤=攻击方；主动消耗=调用方给的 actor）、target = 持盾方、
+    //     amount = 扣减点数。
+    // ⚠️ 与 EVENT_SHIELD_BROKEN（"某笔盾归零"）互补：BROKEN 只说没了，不说来源与点数；
+    //    这两个事件给"按来源计数"的条款用。emit 点：grant_shield / consume_shield 原语，
+    //    以及 deal_damage 的吸收路径（逐笔）。
+    EVENT_SHIELD_GRANTED,
+    EVENT_SHIELD_CONSUMED,
 
 };
 
@@ -304,8 +319,15 @@ public:
     /**
      * emit - 只入队，不执行任何代码。
      * 原语在成功路径末尾调用；投递发生在 FSM 的 drain 点。
+     *
+     * `mute_emissions`（星皇之怒二段，术语 406）：本次额外攻击"不会被其他效果响应"——
+     * 伤害结算期间置位，所有 emit 直接丢弃（不只是一次 drain 的投递门：事件本来就是
+     * 延后投递的，必须在入队处拦）。由 execute_extra_skill_attack 用 RAII 置/清。
      */
     void emit(const BattleEvent& event) {
+        if (mute_emissions) {
+            return;
+        }
         pending_.push_back(event);
     }
 
@@ -397,6 +419,14 @@ public:
     // 存放位：deliver 的死亡监听门与 execute_registered_actions 的时点桶门都读它）。
     bool defeat_effects_suppressed[2]{};
 
+    //--- 星皇之怒二段（术语 406，2026-11-06）---
+    // mute_emissions：额外攻击结算期间丢弃所有 emit（"不会被其他效果响应"）。
+    // silent_death_round[side]：该方在本回合被"沉默二段"打死后，**其自身**的死亡监听与
+    //   被击败时点桶整段压制（"体力因此归0的对手无法触发任何效果"）。按回合号存，
+    //   下一回合自然失配（不用手工清）；复活的同一只精灵后续死亡不再受影响。
+    bool mute_emissions = false;
+    int silent_death_round[2] = {-1, -1};
+
     int watch_count(EventType type) const {
         auto it = by_type_.find(type);
         return it == by_type_.end() ? 0 : static_cast<int>(it->second.size());
@@ -442,6 +472,14 @@ private:
             if (event.type == EventType::EVENT_DEATH
                 && event.target >= 0 && event.target <= 1
                 && defeat_effects_suppressed[event.target]
+                && watcher.owner == event.target) {
+                continue;
+            }
+            // 星皇之怒二段（术语 406）：被二段打死的对手"无法触发任何效果"——
+            // 只压倒下方自己的死亡监听（与上面 2085 同口径：击杀方的击败收益照常）。
+            if (event.type == EventType::EVENT_DEATH
+                && event.target >= 0 && event.target <= 1
+                && silent_death_round[event.target] == current_round
                 && watcher.owner == event.target) {
                 continue;
             }

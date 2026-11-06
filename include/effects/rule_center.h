@@ -374,6 +374,8 @@ struct RuleTicket {
     //    威力够不够高"。传的是 `Skills::power`（**面板威力**），**不是** `ws.skill_power_view`——
     //    官方口径：威力宝石/变威力类效果改的是视图，条件盔看的是面板（用户 2026-09-13）。
     std::function<bool(BattleContext*, int user, int power, bool is_attribute_skill)> condition;
+    // ③层命中失效的可选条件（按被失效方当前点选技能判定；false = 本次不响应、不消耗）
+    std::function<bool(BattleContext*, int)> hit_invalid_condition;
 
     // ── 消费 / 生命周期 ─────────────────────────────────
     int remaining_counts = 0;      // 次数（>0；响应即减，减到 0 注销）
@@ -397,6 +399,8 @@ struct RuleTicket {
     int chance_threshold_pct = 50;
     int chance_below_result = 0;    // ≤ 阈值 → 改写成它（<0 = 不管）
     int chance_above_result = -1;   // > 阈值 → 改写成它（<0 = 不管）
+    int chance_add_pct = 0;         // 相对增量（>阈值时加到原概率；阈值<0 = 无条件加）
+    int chance_status_id = -1;      // 只管辖该异常 id（-1 = 全部）
     uint32_t chance_source_mask = 0;  // ChanceSource 位掩码：管辖哪些来源（0 = 一位都不管）
 
     // ── 条件免疫（IMMUNE · ANOMALY）回调 ────────────────
@@ -817,6 +821,39 @@ public:
         t.subtype = mode;
         t.remaining_counts = count;
         t.source_valid_id = source_valid_id;
+        all_.push_back(std::move(t));
+    }
+
+    void grant_hit_invalid_rounds(int target, int source_slot, int source_effect_id, int mode,
+                                   int rounds, bool is_attribute_skill,
+                                   EffectScope scope = EffectScope::ON_STAGE,
+                                   int source_valid_id = 0,
+                                   std::function<bool(BattleContext*, int)> condition = nullptr) {
+        if (target < 0 || target > 1 || rounds <= 0) return;
+        const RuleCategory category = hit_invalid_category_for(is_attribute_skill);
+        for (RuleTicket& t : all_) {
+            if (t.category == category && t.source_owner == target
+                && t.source_effect_id == source_effect_id && t.subtype == mode) {
+                t.source_slot = source_slot;
+                t.scope = scope;
+                t.remaining_rounds = rounds;
+                t.register_round = 0;
+                t.source_valid_id = source_valid_id;
+                t.hit_invalid_condition = std::move(condition);
+                return;
+            }
+        }
+        RuleTicket t;
+        t.source_owner = target;
+        t.source_slot = source_slot;
+        t.source_effect_id = source_effect_id;
+        t.scope = scope;
+        t.target = target;
+        t.category = category;
+        t.subtype = mode;
+        t.remaining_rounds = rounds;
+        t.source_valid_id = source_valid_id;
+        t.hit_invalid_condition = std::move(condition);
         all_.push_back(std::move(t));
     }
 
@@ -1500,7 +1537,8 @@ public:
     // category, tag) 刷新不追加（与 ATTACH_BAN 同款）。
     int grant_chance_gate(int owner, int source_effect_id, ChanceTag tag, int threshold_pct,
                           int below_result, int above_result, uint32_t source_mask, int rounds,
-                          int register_round, EffectScope scope = EffectScope::ON_STAGE) {
+                          int register_round, EffectScope scope = EffectScope::ON_STAGE,
+                          int status_id = -1, int add_pct = 0) {
         if (owner < 0 || owner > 1) {
             return 0;
         }
@@ -1513,6 +1551,8 @@ public:
                 t.chance_threshold_pct = threshold_pct;
                 t.chance_below_result = below_result;
                 t.chance_above_result = above_result;
+                t.chance_add_pct = add_pct;
+                t.chance_status_id = status_id;
                 t.chance_source_mask = source_mask;
                 t.remaining_rounds = rounds;
                 t.register_round = register_round;
@@ -1529,6 +1569,8 @@ public:
         t.chance_threshold_pct = threshold_pct;
         t.chance_below_result = below_result;
         t.chance_above_result = above_result;
+        t.chance_add_pct = add_pct;
+        t.chance_status_id = status_id;
         t.chance_source_mask = source_mask;
         t.remaining_rounds = rounds;
         t.register_round = register_round;
@@ -1549,7 +1591,8 @@ public:
     // pct 语义：<=0 必定不触发、>=100 必定触发、其余走一次 rand。
     // actor 现在只用于溯源；将来"永沐"式"按施加方记账"（给对手挂曝）在这里读。
     int rewrite_anomaly_chance(int protected_side, int actor, int pct, ChanceTag tag,
-                               ChanceSource source, int current_round) const {
+                               ChanceSource source, int current_round,
+                               int anomaly_id = -1) const {
         (void)actor;
         if (protected_side < 0 || protected_side > 1 || pct < 0) {
             return pct;
@@ -1560,6 +1603,10 @@ public:
         for (const RuleTicket& t : all_) {
             if (t.category != RuleCategory::CHANCE_GATE || t.target != protected_side
                 || t.subtype != tag_value) {
+                continue;
+            }
+            if (t.chance_status_id >= 0 && anomaly_id >= 0
+                && t.chance_status_id != anomaly_id) {
                 continue;
             }
             if ((t.chance_source_mask & bit) == 0) {
@@ -1575,6 +1622,26 @@ public:
                 }
             } else if (t.chance_above_result >= 0) {
                 out = t.chance_above_result;
+            }
+        }
+        // 相对增量：阈值 <0 = 无条件；否则只在本档（原概率 > 阈值）生效。
+        for (const RuleTicket& t : all_) {
+            if (t.category != RuleCategory::CHANCE_GATE || t.target != protected_side
+                || t.subtype != tag_value || t.chance_add_pct == 0) {
+                continue;
+            }
+            if (t.chance_status_id >= 0 && anomaly_id >= 0
+                && t.chance_status_id != anomaly_id) {
+                continue;
+            }
+            if ((t.chance_source_mask & bit) == 0) continue;
+            if (t.remaining_rounds > 0
+                && (current_round < t.register_round
+                    || current_round >= t.register_round + t.remaining_rounds)) {
+                continue;
+            }
+            if (t.chance_threshold_pct < 0 || out > t.chance_threshold_pct) {
+                out = static_cast<int>(std::clamp(out + t.chance_add_pct, 0, 100));
             }
         }
         return out;
@@ -1606,7 +1673,8 @@ public:
 
     // 消费一次 ③层命中效果失效。**只消费与本次技能类型匹配的那一类**
     // （攻击技能 → HIT_INVALID_ATTACK；属性技能 → HIT_INVALID_ATTRIBUTE）。
-    std::optional<int> consume_hit_invalid(int defender, bool is_attribute_skill) {
+    std::optional<int> consume_hit_invalid(BattleContext* ctx, int defender,
+                                           bool is_attribute_skill) {
         if (defender < 0 || defender > 1) {
             return std::nullopt;
         }
@@ -1616,6 +1684,9 @@ public:
             if (t.category != category || t.target != defender) {
                 continue;
             }
+            if (t.hit_invalid_condition && !t.hit_invalid_condition(ctx, defender)) {
+                continue;
+            }
             if (t.remaining_counts > 0) {
                 const int mode = t.subtype;
                 --t.remaining_counts;
@@ -1623,6 +1694,9 @@ public:
                     all_.erase(it);
                 }
                 return mode;
+            }
+            if (t.remaining_rounds > 0) {
+                return t.subtype;   // 回合型：不按次扣，由 cleanup tick 过期
             }
         }
         return std::nullopt;

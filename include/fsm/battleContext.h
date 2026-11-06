@@ -27,6 +27,7 @@
 #include <effects/trait_state.h>
 #include <effects/common_trait_effects.h>
 #include <effects/spirit_lifecycle.h>
+#include <effects/extra_spirit_combat.h>
 #include <effects/state_tape.h>
 #include <entities/soul_mark.h>
 #include <fsm/state.h>
@@ -40,6 +41,54 @@ enum class EffectContainer {
     SoulMark,
     Set,
 };
+
+// ── 团体精灵：主位/副位担任精灵（2026-11-06，2581 帝皇之戎）──────────────
+// 官方术语 579/580/581：团体精灵由多个精灵个体共同构成，每个个体拥有**独立的
+// 体力值、PP 值**；体力/PP 变化仅由主位承担，主位死亡后副位接替主位。
+// 本结构是「等价真实参战模型」：在场 ElfPet 永远承载**当前主位**的 hp/pp，
+// 另一位的 hp/pp 独立存在 forms[sub_form]（下场不消失）。
+// 只在 2581 首次使用时由效果侧初始化/安装死亡接替拦截器。
+struct GroupSpiritFormState {
+    int identity = 0;          // 1=帝皇之钺 / 2=帝皇之御
+    int hp = 0;                // 该个体独立体力
+    int pp[5] = {0, 0, 0, 0, 0};
+    int max_pp[5] = {0, 0, 0, 0, 0};
+};
+
+struct GroupSpiritState {
+    bool active = false;
+    int side = -1;
+    int slot = -1;             // 占用的出战背包槽（团体精灵本体槽）
+    int main_form = 0;         // forms 下标：当前主位
+    int sub_form = 1;          // forms 下标：当前副位
+    bool has_sub = true;       // 副位接替后 = false（副位空缺）
+    GroupSpiritFormState forms[2];
+};
+
+// 额外精灵「懒补全」回调（2026-11-06，2584）：内核不持有官方技能装配能力，由 native
+// 效果侧注册一个 filler，把只有 source_effect_id 的裸 2584 条目补成可参战数据。
+// 仅对 source_effect_id==2584 生效；传统额外精灵（黑白龙/尸骸）不触发。
+using ExtraSpiritFiller = void (*)(ExtraSpirit&);
+inline ExtraSpiritFiller& extra_spirit_filler_slot() {
+    static ExtraSpiritFiller fn = nullptr;
+    return fn;
+}
+inline void set_extra_spirit_filler(ExtraSpiritFiller fn) {
+    extra_spirit_filler_slot() = fn;
+}
+
+// 战斗开始时点扩展回调（GAME_START，2026-11-06）：native 效果侧在这里做“本应在
+// battle_runtime 战斗开始扫描”的挂载（2581 团体精灵主/副位模型、2584 懒补全等）。
+// 调用点 = BattleFsm::handle_GameStart（此时 BattleRuntime 已把 PetInput 的
+// mainPosition 等写入 plugin_storage）。
+using BattleStartExtraHook = void (*)(BattleContext*);
+inline BattleStartExtraHook& battle_start_extra_hook_slot() {
+    static BattleStartExtraHook fn = nullptr;
+    return fn;
+}
+inline void set_battle_start_extra_hook(BattleStartExtraHook fn) {
+    battle_start_extra_hook_slot() = fn;
+}
 
 
 class BattleContext {
@@ -308,6 +357,26 @@ public:
     // （clearAllEffects 随对局重置）。莫妮卡自己不打标（庇只给队友）。
     bool pp_retain_pet[2][6]{};
 
+    //--- PP 恢复前置票（effect 2539「对手无法通过技能恢复PP值」，2026-11-06）---
+    // 下标 = **被封锁方**。为 true 时 `pp_restore` / `pp_restore_points` /
+    // `pp_restore_slot` 一律不入账（返回 0，不写 pp、不发事件）。
+    // 为什么是"前置票"而不是在效果侧拦截：PP 恢复有 60+ 个调用点（技能/魂印/套装），
+    // 逐个判断既漏又改不动；收口在原语入口是唯一能覆盖全部来源的落点。
+    // ⚠️ 口径近似：官方原话是"**通过技能**恢复PP"。技能效果与**魂印/套装**侧的回 PP
+    //    共用 pp_restore* 原语 → 本票把它们一并拦下；**嗑药**（use_medicine）直接写
+    //    `skill.pp`、不经过原语，因此不受本票影响（与"技能"限定一致）。
+    //    若将来要按来源细分，再给原语加 source 参数，而不是在效果侧各显神通。
+    // 生命周期：由效果侧按条件每回合重写（2539 的 ROUND_START 节点），换宠/清场复位。
+    bool pp_restore_blocked[2]{};
+
+    //--- 专属特性概率抬升（effect 2190 码 9「携带此技能时，专属特性中的所有概率提升至100%」）---
+    // 下标 = 携带方。`effective_common_trait` 返回的 EffectiveTrait 会把 proc_forced 置真
+    // （与妙时天女复制升级同一载荷，见 effects/trait_state.h 的 trait_proc_roll）。
+    // 为什么放 context 而非改 pet.commonTrait：proc_forced 是**战斗内生效视图**，
+    // 且换宠重拷特性槽时不能丢（carry 事实整场有效）。
+    bool trait_proc_forced[2]{};
+
+
     //--- 当回合无法行动（effect 39 族："若对手所选择的技能PP值为0则当回合对手无法行动"）---
     // 与控制异常的区别：被控**不跳过**额外行动时点（额外行动声明照常消费），
     // 无法行动**跳过**主流程且压制额外行动声明（用户 2026-09-22 口径，孑身诫实测）。
@@ -340,6 +409,61 @@ public:
     // 换宠即清（invalidate_on_stage_effects，"印记绑定对手，下场不保留"）。
     // 消费方：on_selected 重定向（剥夺原技能固有先制）+ resolve_executing_skill（执行替换技能）。
     SkillReplaceSource pending_skill_replacement[2];
+
+    //--- 跨精灵按技能 id 构造的复制技能（457 / 1656，2026-11-06）---
+    // resolve_skill_execution 在执行期扫到点选技能含 457/1656 时按目标 id 构造一份 Skills
+    // 放进这里，并经 pending_skill_replacement[owner].external_skill 指向它。
+    // 不拷贝精灵/技能槽数据：Skills(int id) 从数据层重新组装（与技能库同源），效果分支
+    // 因此完整可执行。生命周期：下一次复制覆盖、换宠/清场释放；pending 消费只清描述符。
+    std::unique_ptr<Skills> copied_skill_for_use[2];
+
+    //--- 对手最近释放的技能（457"复制对手释放的技能"数据源）---
+    // 每次 resolve_skill_execution 用**实际执行技能**（替换后）刷新；按方存。
+    // round 记释放回合（当前实现按时间顺序取最近一次，不限制窗口）。
+    struct LastUsedSkill {
+        int skill_id = 0;
+        int round = -1;
+    };
+    LastUsedSkill last_used_skill[2];
+
+    //--- 蓄力/待发（官方效果 17"1回合等待，次回合攻击"，2026-11-06）---
+    // 首回合：resolve_skill_execution 识别点选技能含 effect 17 → 记 pending，不执行技能、
+    //   不注册效果、不结算伤害（本回合"等待"）；PP 仍在 AFTER_ACTION 正常扣除。
+    // 次回合：resolve_skill_execution 消费 pending → 把 roundChoice 重定向到 pending.slot
+    //   并正常执行（伤害/效果全跑）。`last_charged_release_round` 防止释放当回合再次蓄力。
+    // 换宠/清场清空；被控导致当回合不能行动时 pending 保留（下一回合继续释放）。
+    struct PendingChargedSkill {
+        bool active = false;
+        int slot = -1;          // 蓄力技能槽（0..4）
+        int target = -1;        // 目标方（1-owner；跨回合保留）
+        int charge_round = -1;  // 蓄力所在回合
+    };
+    PendingChargedSkill pending_charged_skill[2];
+    int last_charged_release_round[2]{-1, -1};
+
+    // 安装复制技能并注入执行期替换。返回 false = id 非法/组装失败（回退原技能）。
+    // 内联：插件动态库不链接 sim_core（仿 grant_penetration 先例）。
+    bool install_copied_skill(int owner, int skill_id, int source_slot) {
+        if (owner < 0 || owner > 1 || skill_id <= 0) {
+            return false;
+        }
+        try {
+            auto skill = std::make_unique<Skills>(skill_id);
+            copied_skill_for_use[owner] = std::move(skill);
+        } catch (...) {
+            copied_skill_for_use[owner].reset();
+            // 防悬垂：若 pending 还指着旧的 external_skill，半成品失败后一并清掉。
+            pending_skill_replacement[owner] = SkillReplaceSource{};
+            return false;
+        }
+        SkillReplaceSource src;
+        src.active = true;
+        src.source_owner = owner;
+        src.slot = (source_slot >= 0 && source_slot < 5) ? source_slot : 0;
+        src.external_skill = copied_skill_for_use[owner].get();
+        pending_skill_replacement[owner] = src;
+        return true;
+    }
 
     //--- 精灵系别半持久化视图（当前在场精灵有效系别）---
     // 改系别效果（属性反转/龙琰类）写这里，跨回合保留（ws 每回合 reset 会清，故放 context）。
@@ -468,6 +592,124 @@ public:
         }
     }
 
+    //--- 按技能 id/模板构造的**技能槽本体替换**入口（2545 第五技能转瑰·…，2026-11-06）---
+    // 与 `pending_skill_replacement`（执行期临时重定向、用后即耗）的区别：
+    //   · 本入口改写的是 ElfPet::skills[skill_slot] **本体**——整场有效、参与选择期
+    //     （on_selected/先制/PP 判定都按新技能走）、换宠保留；
+    //   · 构造由调用方完成（宿主用 build_skill_effect_nodes 按 effect id 装配出 Skills；
+    //     走 `Skills(int id)` 也可以，但那条路要求官方数据层就绪）。
+    // 生命周期：整场（clearAllEffects 不清技能槽——技能是输入装配事实；换形态类效果
+    // 自己决定是否再改）。返回 false = 参数非法/目标槽为空。
+    bool replace_skill_slot(int owner, int pet_slot, int skill_slot, Skills replacement) {
+        if (owner < 0 || owner > 1 || pet_slot < 0 || pet_slot >= 6 || skill_slot < 0
+            || skill_slot >= 5) {
+            return false;
+        }
+        ElfPet& pet = seerRobot[owner].elfPets[pet_slot];
+        if (pet.id < 0) {
+            return false;
+        }
+        pet.skills[static_cast<std::size_t>(skill_slot)] = std::move(replacement);
+        return true;
+    }
+
+    //--- 支援效果登记表（术语 342「支援」，2026-11-06 技能侧第十九轮）---
+    // 术语 342：**存活的不在场精灵**向在场精灵提供的效果（如 2544 支援魂歌报丧、
+    // 2599 圣荷慰心）。此前内核没有"支援效果"这个概念，于是 2236「使自身下{0}次**可翻倍**
+    // 的支援效果翻倍」既无法判定哪些支援可翻倍，也没有可消费的翻倍计数。
+    //
+    // 模型（最小可用）：
+    //   · 支援方登记一条 `SupportEffectEntry`（来源方/来源槽/效果 id/量/是否可翻倍）；
+    //   · 2236 一类的"翻倍次数"入 `support_double_charges_`（按方）；
+    //   · 支援效果在**结算时**调 `support_effect_magnitude()`：可翻倍且还有次数 →
+    //     量×2 并消耗 1 次（"可翻倍"由数据/术语判定，内核不猜）。
+    // 生命周期：登记表随来源槽在场状态失效（来源上场/死亡时清该槽），清场全清。
+    // ⚠️ 生产端尚未接线（2544 在 misc_4、2236 在 misc_3，本轮不在可改文件范围）；
+    //    本表先给出可调用入口，接线时只调这几个方法，不用再改内核。
+    struct SupportEffectEntry {
+        int source_owner = -1;     // 提供支援的一方
+        int source_pet_slot = -1;  // 提供支援的精灵槽（场下存活）
+        int effect_id = 0;         // 支援效果 id
+        int magnitude = 0;         // 效果量（语义由消费端解释）
+        bool doubleable = false;   // 是否"可翻倍"
+    };
+    std::array<std::vector<SupportEffectEntry>, 2> support_effects_{};
+    std::array<int, 2> support_double_charges_{};
+
+    /** 登记/覆盖一条支援效果（同一 来源槽+effect_id 视为同一条）。返回登记后的量。 */
+    int register_support_effect(int owner, int pet_slot, int effect_id, int magnitude,
+                                bool doubleable) {
+        if (owner < 0 || owner > 1 || pet_slot < 0 || pet_slot >= 6) {
+            return 0;
+        }
+        for (SupportEffectEntry& e : support_effects_[owner]) {
+            if (e.source_pet_slot == pet_slot && e.effect_id == effect_id) {
+                e.magnitude = magnitude;
+                e.doubleable = doubleable;
+                return e.magnitude;
+            }
+        }
+        support_effects_[owner].push_back(
+            SupportEffectEntry{owner, pet_slot, effect_id, magnitude, doubleable});
+        return magnitude;
+    }
+
+    /** 清掉某槽的全部支援登记（该槽上场/死亡/失效时调用；pet_slot=-1 = 清全方）。 */
+    void clear_support_effects(int owner, int pet_slot = -1) {
+        if (owner < 0 || owner > 1) {
+            return;
+        }
+        auto& list = support_effects_[owner];
+        if (pet_slot < 0) {
+            list.clear();
+            return;
+        }
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [pet_slot](const SupportEffectEntry& e) {
+                                      return e.source_pet_slot == pet_slot;
+                                  }),
+                   list.end());
+    }
+
+    /** 授予"下 N 次可翻倍支援效果翻倍"（2236）。返回累计剩余次数。 */
+    int add_support_double_charges(int owner, int count) {
+        if (owner < 0 || owner > 1 || count <= 0) {
+            return owner >= 0 && owner <= 1 ? support_double_charges_[owner] : 0;
+        }
+        support_double_charges_[owner] += count;
+        return support_double_charges_[owner];
+    }
+
+    int support_double_charges(int owner) const {
+        return (owner >= 0 && owner <= 1) ? support_double_charges_[owner] : 0;
+    }
+
+    /** 消费一次翻倍机会（可翻倍支援效果结算时调用）；没有次数返回 false。 */
+    bool consume_support_double(int owner) {
+        if (owner < 0 || owner > 1 || support_double_charges_[owner] <= 0) {
+            return false;
+        }
+        --support_double_charges_[owner];
+        return true;
+    }
+
+    /** 支援效果结算时的取值口：可翻倍且还有次数 → ×2 并消耗一次。 */
+    int support_effect_magnitude(int owner, int effect_id) {
+        if (owner < 0 || owner > 1) {
+            return 0;
+        }
+        for (const SupportEffectEntry& e : support_effects_[owner]) {
+            if (e.effect_id != effect_id) {
+                continue;
+            }
+            if (e.doubleable && consume_support_double(owner)) {
+                return e.magnitude * 2;
+            }
+            return e.magnitude;
+        }
+        return 0;
+    }
+
     //--- 场下源抑制场域（薇尔诗 2513，双方通用）---
     // "自身存活于出战阵容时，双方场下的精灵无法指定场上精灵为效果对象"（effect_icon 2098）。
     // 不分敌我——薇尔诗在任一方存活即全场生效（档案 §4.2.3 定：context 全局，非 per-owner）。
@@ -508,6 +750,16 @@ public:
     // 从根上避开"游戏开始时获得的尸体不被消逝"那类 bug）、乔特鲁德黑白龙。
     // 本体死亡或被消逝不影响这里的条目（idx=149 #6）。clearAllEffects 清空。
     std::vector<ExtraSpirit> extra_spirits[2];
+
+    //--- 团体精灵主/副位模型（2581）---
+    // 每方最多 1 只团体精灵（帝皇之戎）；forms[main] 的 hp/pp 与在场 ElfPet 同步。
+    // 生命周期：2581 首次使用时初始化；clearAllEffects 复位。
+    GroupSpiritState group_spirit[2];
+
+    //--- 回合开始效果先制（2341 赛博共振器）---
+    // true = 本方的 BATTLE_ROUND_START 桶先于对方结算（"己方的回合开始效果先制+1"）。
+    // 由 2341 开启时置位、关闭时清零；clearAllEffects 复位。
+    bool round_start_priority[2] = {false, false};
 
     // ── 双背包模型（精灵王线，2026-09-25 用户口径校准）───────────────────
     // 每边**两张静态背包**：出战背包（6 格，进战斗）+ 待命背包（6 格，不进战斗），
@@ -555,14 +807,66 @@ public:
         int actor = -1;
         int amount = 0;
         int kind = -1;
+        int round = -1;   // 该次落血发生的回合（-1=无），供“上回合受击”类效果判定
         bool valid = false;
     };
     LastLandedHit last_landed_hit[2][6]{};
+    // 上回合结束时是否无异常（2562 等“上回合无异常”条件）
+    bool prev_round_end_anomaly_free[2]{true, true};
+    // 本次/上次登场期间被免疫票实际挡下的异常 id 位图（2497 用）。
+    uint64_t entry_immunity_mask[2]{};
+    uint64_t last_entry_immunity_mask[2]{};
+    // 跨回合攻击伤害保底（2295“造成的攻击伤害不低于…”）
+    int damage_floor_persistent[2]{};
+    // “下次附加异常概率 +N 个百分点”/“抗性≤M% 忽略 M%”一次性加成（按施加方）。
+    int anomaly_chance_add[2]{};
+    int anomaly_chance_add_threshold[2]{-1, -1};
+    int anomaly_chance_add_status[2]{-1, -1};
+    int anomaly_resist_ignore_pct[2]{};
 
     //--- 技能效果执行表 ---
     // TimedBucket 封装：注册/同源去重/时点执行/过期清理/epoch 作废/回合计数（见 effects/timed_bucket.h）。
     // 内层 key = (source_id << 32) | effect_id，同源同 effect 新注册自动覆盖旧。
     TimedBucket skills_effects;
+
+    //--- 本次在场已生效技能效果台账（per-stay）---
+    // 数据源给「此技能拥有本次在场期间自身生效过的所有构造效果」（技能效果 2153）：
+    // 技能效果在 SKILL_EFFECT 时点将要执行时，由 execute_registered_actions 收口把
+    // (effect_id → 函数指针 + 已绑定参数 + 回合 + 是否先出手) 记进本表。只记**生效那次**：
+    // 先出手的执行记 was_first=true 且此后同 id 的后出手执行不覆盖；后出手先记到时
+    // 允许被后续先出手的执行覆盖。同 id 只保留一条（"拥有该效果"是集合语义，不是计数）。
+    //
+    // 生命周期 = **本次在场**：perform_switch → invalidate_on_stage_effects 清空该方；
+    // 清场 clearAllEffects 清空。与 ElfPet::on_stage_storage 同口径。
+    // ⚠️ fn 是 native 效果实现指针（EffectFn），args 是 bind_participants 绑定过
+    //    owner/opponent 的拷贝；重放方必须同进程、同一对局内使用，不得跨局缓存。
+    struct StaySkillEffectRecord {
+        int effect_id = 0;
+        EffectFn fn = nullptr;     // 执行时的效果函数（native 实现指针）
+        EffectArgs args;           // 已绑定 owner/opponent 的参数（重放用）
+        int round = -1;            // 生效回合
+        bool was_first = false;    // 执行时是否先出手（构造 I~IV 的唯一触发条件）
+    };
+    std::array<std::map<int, StaySkillEffectRecord>, 2> stay_skill_effects{};
+
+    // 记录一条"本次在场已生效"的技能效果（见上）。
+    // 规则：同 id 已有先出手记录 → 直接忽略；否则写入/覆盖。
+    void record_stay_skill_effect(int owner, const Effect& effect, bool was_first) {
+        if (owner < 0 || owner > 1 || effect.id <= 0 || effect.logic == nullptr) {
+            return;
+        }
+        std::map<int, StaySkillEffectRecord>& log = stay_skill_effects[owner];
+        auto it = log.find(effect.id);
+        if (it != log.end() && it->second.was_first) {
+            return;  // 已记到先出手那次，后出手的执行不覆盖
+        }
+        StaySkillEffectRecord& rec = log[effect.id];
+        rec.effect_id = effect.id;
+        rec.fn = effect.logic;
+        rec.args = effect.args;
+        rec.round = roundCount;
+        rec.was_first = was_first;
+    }
 
     //--- 魂印效果执行表 ---
     // 与技能桶同类容器；执行顺序上魂印先于技能（execute_registered_actions）。
@@ -1068,7 +1372,14 @@ public:
         force_execute_on_pp0[owner] = false;  // 魂印条件信号不继承给新精灵（待新魂印重新激活）
         ignore_pp[owner] = false;
         pp_reverse[owner] = false;
+        pp_restore_blocked[owner] = false;  // 2539 PP 恢复前置票不继承给新精灵
+        // 2190 码 9 的"专属特性概率抬升"随**携带方**生效：换宠即清，携带方再登场时由
+        // 效果侧的 EVENT_ENTER_STAGE 监听重新置位（不能留在侧级——新精灵的特性不该被抬）。
+        trait_proc_forced[owner] = false;
         pending_skill_replacement[owner] = SkillReplaceSource{};  // 米修莉式转换不继承（"下场不保留"）
+        copied_skill_for_use[owner].reset();       // 复制技能不继承（457/1656）
+        pending_charged_skill[owner] = PendingChargedSkill{};  // 蓄力待发不继承（17）
+        last_charged_release_round[owner] = -1;
         // 统一规则容器：清掉**下场精灵**（当前 on_stage）挂载的 ON_STAGE 条目
         // （免疫源 + 盔/威/封属 + ③层命中失效一起）；TEAM 绑定保留（队伍被动，切换不丢）。
         // ⚠️ 生命周期锚 source：封属/命中失效挂**施放方**，故清的是施放方换宠名下的；
@@ -1085,12 +1396,16 @@ public:
         heal_mod_pct[owner] = 0;             // 恢复效果修正不继承
         anomaly_conversion[owner].clear();   // 异常转化规则不继承（镜像：弹控已并入 RuleCenter REFLECT，随切回清）
         elf_element_view_bound_slot[owner] = -1;  // 新精灵下次 sync 重基系别
+        // 本次在场技能效果台账：下场即清（"本次在场期间"的边界；与 on_stage_storage 同点）。
+        stay_skill_effects[owner].clear();
     }
 
     //--- 清空效果 ---
     void clearAllEffects() {
         skills_effects.clear();
         soul_mark_effects.clear();
+        stay_skill_effects[0].clear();
+        stay_skill_effects[1].clear();
         suit_effects.clear();   // 套装条目随对局清；下一局由 activate_suits 重新激活
         passive_effects.clear();   // 被动桶（第四容器）随对局清——死亡印记结算节点不跨局残留
         updater_effects.clear();
@@ -1104,6 +1419,14 @@ public:
         ignore_pp[1] = false;
         pp_reverse[0] = false;
         pp_reverse[1] = false;
+        pp_restore_blocked[0] = false;
+        pp_restore_blocked[1] = false;
+        trait_proc_forced[0] = false;
+        trait_proc_forced[1] = false;
+        support_effects_[0].clear();          // 支援登记表随对局清（术语 342）
+        support_effects_[1].clear();
+        support_double_charges_[0] = 0;       // 2236 的翻倍次数随对局清
+        support_double_charges_[1] = 0;
         pink_reduce_pct[0] = pink_reduce_pct[1] = 0;
         heal_mod_pct[0] = heal_mod_pct[1] = 0;
         anomaly_conversion[0].clear();
@@ -1117,6 +1440,10 @@ public:
         death_interceptors.clear();          // 死亡拦截器（免死/真2命）随对局清
         extra_spirits[0].clear();            // 额外精灵容器随对局清（黑白龙/咽咎尸骸…）
         extra_spirits[1].clear();
+        group_spirit[0] = GroupSpiritState{};   // 团体精灵主/副位模型随对局清（2581）
+        group_spirit[1] = GroupSpiritState{};
+        round_start_priority[0] = false;        // 回合开始效果先制（2341）随对局清
+        round_start_priority[1] = false;
         hp_consume_marks.clear();            // 消耗全部体力印记（死亡印记）随对局清（连续对局复用 context 防泄漏）
         anomaly_view_layers.clear();         // K6 虚拟异常视图层数随对局清
         for (int side = 0; side < 2; ++side) {
@@ -1127,6 +1454,15 @@ public:
         }
         pending_skill_replacement[0] = SkillReplaceSource{};
         pending_skill_replacement[1] = SkillReplaceSource{};
+        copied_skill_for_use[0].reset();
+        copied_skill_for_use[1].reset();
+        last_used_skill[0] = LastUsedSkill{};
+        last_used_skill[1] = LastUsedSkill{};
+        pending_charged_skill[0] = PendingChargedSkill{};
+        pending_charged_skill[1] = PendingChargedSkill{};
+        last_charged_release_round[0] = last_charged_release_round[1] = -1;
+        event_center_.silent_death_round[0] = event_center_.silent_death_round[1] = -1;
+        event_center_.mute_emissions = false;
         elf_element_view_bound_slot[0] = elf_element_view_bound_slot[1] = -1;
         for (int p = 0; p < 2; ++p) {
             for (ElfPet& pet : seerRobot[p].elfPets) {
@@ -1439,6 +1775,14 @@ public:
         if (own.kind != TraitKind::None
             && (kind == TraitKind::None || own.kind == kind)
             && (include_suppressed || !is_trait_suppressed(side, own.kind))) {
+            // 2190 码 9：携带方"专属特性中的所有概率提升至100%"——与妙时天女复制升级
+            // 同一载荷（proc_forced），trait_proc_roll 统一消费；换宠重拷特性槽也不会丢
+            // （标志住在 context，不随 trait_state_ 重同步清）。
+            if (trait_proc_forced[side] && !own.proc_forced) {
+                EffectiveTrait forced = own;
+                forced.proc_forced = true;
+                return forced;
+            }
             return own;
         }
         for (const TraitOverlay& e : trait_state_[side].copies) {
@@ -1453,6 +1797,11 @@ public:
             }
             if (e.source_slot >= 0 && e.source_owner >= 0 && on_stage[e.source_owner] != e.source_slot) {
                 continue;
+            }
+            if (trait_proc_forced[side] && !e.trait.proc_forced) {
+                EffectiveTrait forced = e.trait;
+                forced.proc_forced = true;
+                return forced;
             }
             return e.trait;
         }
@@ -1745,6 +2094,28 @@ public:
         int n = 0;
         for (const ExtraSpirit& es : extra_spirits[side]) {
             if (es.state == state) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    // 可上场额外精灵数（2584 瀚宇星皇）：已加入出战背包、尚未实体化、存活且体力>0。
+    // 终局评估/死后补位用它判断"是否还有额外上场槽可用"。
+    // 非 const：遇到只有 source_effect_id 的裸 2584 条目时现场懒补全（filler）。
+    int count_deployable_extra_spirits(int side) {
+        if (side < 0 || side > 1) {
+            return 0;
+        }
+        int n = 0;
+        ExtraSpiritFiller filler = extra_spirit_filler_slot();
+        for (ExtraSpirit& es : extra_spirits[side]) {
+            if (es.source_effect_id == 2584
+                && (es.combat == nullptr || es.combat->pet_id == 0) && filler != nullptr) {
+                filler(es);
+            }
+            if (es.combat != nullptr && es.combat->deployable && !es.combat->in_bag
+                && es.state == ExtraSpiritState::ALIVE && es.combat->hp > 0) {
                 ++n;
             }
         }

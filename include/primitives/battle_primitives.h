@@ -374,6 +374,27 @@ void deal_damage(BattleContext* ctx, int target, int amount,
 int consume_shield(BattleContext* ctx, int target, int amount, int* broken_count = nullptr);
 
 /**
+ * grant_shield - **给具名护盾入账**（2026-11-06，技能侧第十九轮；1691 族）。
+ * 与直接 `pet.shield_bank_.add(...)` 的唯一区别：本原语在入账成功后 emit
+ * `EVENT_SHIELD_GRANTED`（actor = -1、target = 持盾方、amount = 入账点数、
+ * grant_id = source_id）——"<具名盾>下 N 次被激活或被消耗"（1691 终阶源盾）这类
+ * **按来源计数**的条款需要"被激活"这一半，而 source_id 是唯一能把它跟别的盾分开的键。
+ *
+ * 约定：同一具名资源用固定 source_id（不要每次换号），刷新用同号 add/refresh 语义——
+ * 条款按 source_id 计数，换号会把同一笔盾算成两笔。
+ *
+ * @param target    持盾方（0/1）
+ * @param priority  吸收优先级（魂印专属盾建议 ShieldBank::kSoulShieldPriority）
+ * @param quantity  入账点数（<=0 直接返回 0，不发事件）
+ * @param source_id 具名来源 id（效果/术语约定的资源键）
+ * @param duration  持续回合（0 = 破盾前持续）
+ * @param actor     授予方（未知传 -1；仅用于调试/审计）
+ * @return 实际入账点数（容量满返回 0）
+ */
+int grant_shield(BattleContext* ctx, int target, int priority, int quantity, int source_id,
+                 int duration = 0, int actor = -1);
+
+/**
  * pp_restore_slot - PP 恢复到 maxPP（精灵王线 K7，2026-09-24）：(side, 宠槽, 技能槽)
  * 三址寻址——换宠后 getPet(side) 已是新宠，出场 PP 转移链要恢复的是**场下上只**。
  * 无限 PP 槽（pp==-1/maxPP<=0）不动，已满返回 0。
@@ -440,6 +461,10 @@ int seal_skill(BattleContext* ctx, int source, int target, int effect_id, bool a
  */
 void hit_effect_invalid(BattleContext* ctx, int target, HitInvalidMode mode,
                         int count, bool is_attribute_skill, int source_id = -1);
+
+/** 回合型“命中效果失效”：持续 rounds 回合，不按次消耗。 */
+void hit_effect_invalid_rounds(BattleContext* ctx, int target, HitInvalidMode mode,
+                               int rounds, bool is_attribute_skill, int source_id = -1);
 
 // ----------------------------------------------------------------
 // 能力等级变化
@@ -751,6 +776,20 @@ enum class HpZeroResult {
  */
 HpZeroResult force_hp_to_zero(BattleContext* ctx, int target, int actor);
 
+/**
+ * consume_hp - **按点数消耗体力**（"消耗/损失自身 X 点体力"族专用）。
+ * 非伤害：护盾/减伤/抗性/免疫均不参与；直接削减 hp 并按需记录击杀归因。
+ * 与 force_hp_to_zero / reset_hp 同属“非治疗 HP 写入口”三件套。
+ * @return 实际消耗量（0 = 参数非法或目标已倒地）
+ */
+int consume_hp(BattleContext* ctx, int target, int amount, int actor = -1);
+
+/**
+ * heal_off_field - 场下精灵治疗（无治疗事件/不吃封回血的“体力恢复”口径）。
+ * @return 实际恢复量
+ */
+int heal_off_field(BattleContext* ctx, int side, int slot, int amount);
+
 // ----------------------------------------------------------------
 // 第二刀新原语（组合语法：无相谛 5 类条件模板）
 // ----------------------------------------------------------------
@@ -765,6 +804,15 @@ enum class PpReduceResult {
  * 每个实际变化的槽 emit EVENT_PP_REDUCED（逐槽；见 event_center.h）。
  */
 PpReduceResult pp_reduce(BattleContext* ctx, int target, int amount);
+
+/** pp_reduce_off_field - 扣场下精灵全部技能 PP（放逐/被处决精灵线）。 */
+int pp_reduce_off_field(BattleContext* ctx, int side, int pet_slot, int amount);
+
+/** pp_reduce_slot - 只扣目标方指定技能槽的 PP（"随机 1 个技能 -N 点"族）。 */
+PpReduceResult pp_reduce_slot(BattleContext* ctx, int target, int slot, int amount);
+
+/** pp_set_slot - 把指定技能槽 PP 设为 value（钳 0..maxPP；"均等化/设为定值"族）。 */
+int pp_set_slot(BattleContext* ctx, int target, int slot, int value);
 
 /**
  * pp_zero_slot - 清零目标方**指定一个槽位**的 PP（"随机{0}项技能 PP 归零"族专用原语，
@@ -781,6 +829,10 @@ PpReduceResult pp_zero_slot(BattleContext* ctx, int target, int slot, int actor 
  * pp==0 的槽（亮节口径）。返回实际变化的槽位数。
  * ⚠️ 不 emit 事件：EVENT_PP_REDUCED 是"被削"语义，恢复暂无监听方——
  * 将来出现"被恢复 PP 时响应"类效果再补 EVENT_PP_RESTORED（届时补发不破坏既有序列）。
+ * ⚠️ **PP 恢复前置票**：目标方 `ctx->pp_restore_blocked[target]` 为真时本函数直接返回 0
+ * （2539「对手无法通过技能恢复PP值」）。同款前置判断在 `pp_restore_points` /
+ * `pp_restore_slot` / `pp_set_slot`（仅上调方向）里各有一份——收口在原语是唯一能覆盖
+ * 60+ 个调用点的位置，见 battleContext.h 的 `pp_restore_blocked` 注释。
  */
 int pp_restore(BattleContext* ctx, int target, int amount, bool only_empty);
 
@@ -954,6 +1006,27 @@ void register_death_interceptor(BattleContext* ctx, DeathInterceptor interceptor
 /** 注销某来源的全部死亡拦截器（效果失效/被消逝时撤掉自己的那条）。 */
 void remove_death_interceptors(BattleContext* ctx, int source_effect_id);
 
+// ----------------------------------------------------------------
+// 可上场额外精灵（2026-11-06，2584 瀚宇星皇）
+// ----------------------------------------------------------------
+
+/**
+ * materialize_extra_spirit - 把 extra_spirits[side][extra_index] 实体化为一个
+ * **真实 6 槽 ElfPet**（id/系别/面板/5 技能/当前体力），写入指定出战背包槽。
+ * 成功后置 es.in_bag=true / es.bag_slot=slot / es.linked_slot=slot。
+ * 用于两条路径：① 2584 触发时入背包（优先空槽 → 立即可上场/选招）；
+ * ② 死后补位（无空槽时顶替已阵亡的在场槽，由 deploy_extra_spirit 调用）。
+ * @return 成功 true；extra_index 非法 / pet_id<=0 / 状态非 ALIVE 时 false。
+ */
+bool materialize_extra_spirit(BattleContext* ctx, int side, int slot, int extra_index);
+
+/**
+ * deploy_extra_spirit - 死后补位：把本方第一只「可上场且未实体化」的额外精灵
+ * 放进当前在场槽（该槽的旧宠此时已阵亡）。失败（无可用额外精灵）返回 false。
+ * ⚠️ 会覆盖旧宠槽位的数据（旧宠已死亡且本方无其他存活精灵，正常胜负判定本应终局）。
+ */
+bool deploy_extra_spirit(BattleContext* ctx, int side);
+
 /**
  * sync_pending_deaths - **对账兜底**：扫双方 6 槽，把"hp<=0 且未登记死亡"的补登记
  * （cause=EFFECT），并把"hp>0 且登记过"的复位（复活后能再死一次）。
@@ -997,6 +1070,13 @@ enum class OffFieldTrueDamageResult {
  *
  * @return 实际扣掉的体力数；INVALID/PROTECTED 返回 0
  */
+/** 场下粉伤（固定/百分比档）：不吃护盾/护罩，但走死亡漏斗；返回实际扣血量。 */
+int deal_off_field_pink_damage(BattleContext* ctx, int side, int slot, int amount,
+                               DamageKind kind, int actor);
+
+/** 场下秒杀：直接置 0 并走 defeat_pet 死亡漏斗。 */
+bool force_hp_to_zero_at(BattleContext* ctx, int side, int slot, int actor);
+
 OffFieldTrueDamageResult deal_off_field_true_damage(BattleContext* ctx, int side, int slot,
                                                     int amount, int actor,
                                                     int residue_floor = 0);

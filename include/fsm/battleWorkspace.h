@@ -32,10 +32,13 @@ struct DamageSnapshot {
     bool isTrueDamage = false;
     bool isWhiteNumber = false;
     bool isCrit = false;
+    // 本次伤害是否被 CAP（伤害锁定/上限）截断过（供 2300 等“伤害被限制时”效果）
+    bool capped = false;
     // 本次攻击的连击次数（"1回合做 x~y 次攻击"的 N；非连击技能为 1）。
     // `×N` 已经乘进 base/final，这里只作日志与调试用（不参与任何运算）。
     // NSDMI 默认 1；`stage_simple_attack_damage` 每次**显式**赋值，不要依赖默认值。
     int hitCount = 1;
+
     // ── 属性伤害专用（《赛学必修16—伤害类型》；用户 2026-09-18 口径）──────────
     // 本笔结算是否**跳过"常规挡伤"** = core 默认 BLOCK 回调用 `ImmunityType::DAMAGE` 票
     // （"免疫下N次攻击伤害"一族）把整段归零的那条。
@@ -115,6 +118,12 @@ struct SkillReplaceSource {
     bool active = false;
     int source_owner = 0;  // 替换技能所在方（0/1；跨精灵替换：艾欧丽娅=施放方）
     int slot = -1;         // 替换槽位（0..4）
+    // 跨精灵按**技能 id** 构造的替换技能（复制技能 457/1656，2026-11-06）。
+    // 非空时解析优先返回它（见 resolve_replacement_skill）；对象由 BattleContext 的
+    // copied_skill_for_use 持有，生命周期覆盖本次执行（pending 用后即耗只清本描述符，
+    // unique_ptr 由下一次复制/换宠/清场释放）。slot 仍是来源槽位（供
+    // executing_skill_slot 判"第五技能"等按槽语义使用）。
+    class Skills* external_skill = nullptr;
 };
 
 /**
@@ -171,6 +180,10 @@ public:
     int roundChoice[2][2]{};     // [方数][操作类型, 参数索引]
     int lastActionType[2]{};     // 上一次操作类型
     int lastActionIndex[2]{};    // 上一次操作参数
+    // 本回合各方实际受到的伤害累计（含红/粉/真/属性；回合重置）。
+    int damage_taken_round[2]{};
+    int fixed_damage_taken_round[2]{};
+    int fixed_damage_taken_last_round[2]{};
 
     //========== 先手权 ==========
     PreemptiveRight preemptive_right = PreemptiveRight::NONE;
@@ -378,8 +391,21 @@ public:
         // 只钉 roll 起点、跳过必闪减避；命中等级负档/混乱/易燃等数值通道照常作用。
         bool accuracy_fix_100 = false;
         int  level = 0;                      // 穿透等级：0=无, 1=可穿盔（等级比较留 SkillInvalidCenter）
+        // 本次技能**实际穿过**一条「攻击免疫」条目（盔/封属被穿，或免伤票被无视）。
+        // 与 `ignore_attack_immunity`（"请求携带凭证"，可能没遇到任何盔）严格区分：
+        //   · 门判定（RuleCenter::notify）每结算一条被穿的可穿盔 → 置位（skills.cpp 回调）；
+        //   · 红伤 BLOCK 阶段无视 `ImmunityType::DAMAGE` 票 → 置位（battleContext.cpp）。
+        // 用途：2331「无视对手攻击免疫效果，**无视成功**消除对手回合类效果」——"成功"
+        //   的判据只能是"真的穿到了东西"，不能拿凭证存在与否冒充。
+        bool pierced_attack_immunity = false;
     };
     AttackCredential attack_credential[2];   // 按攻击方索引
+
+    // 本回合**无视自身能力下降**（effect 2265 第 1 档「拥有 1 道寂杀之魄时无视自身能力
+    // 下降状态」）：下标 = 该方。伤害公式的等级取值点把负等级钳到 0（正等级不动）。
+    // ws 每回合 reset → 效果侧 ROUND_START 按层数重写（换宠/失效天然复位）。
+    // ⚠️ 顺序无关：即使本回合中途被对手压了等级，`getTempAbilityValue` 读的仍是"视作 0"。
+    bool ignore_level_drop[2]{};
 
     // 本次攻击无视护盾/护罩响应（如无极圣武魂印"自身攻击无视护盾承伤效果"）。
     // 效果在 ROUND_START/SKILL_EFFECT 置位；deal_damage 据此跳过对应银行的吸收。
@@ -394,6 +420,7 @@ public:
     // 与束缚(28)同语义（battleFsm 先制结算点清零先制），但它是**非异常**条件区，
     // 由技能效果按条件重写；束缚失效不受它影响（各自独立清零一次，幂等）。
     bool priority_nullified[2]{};
+    bool priority_nullify_positive_only[2]{};
     // 当回合该方是否受到过攻击伤害（水王 2343 战斗阶段结束分支的检测旗，2026-09-24）：
     // 由 EVENT_TAKE_DAMAGE watcher（魂印侧）置位、BATTLE_ROUND_END 节点消费后清零。
     bool nutao_took_attack_damage[2]{};
@@ -519,6 +546,15 @@ public:
     int  skill_element_grant[2][2]{};
     bool skill_element_grant_valid[2]{};
 
+    // **本系加成（STAB）系别覆盖**（复制技能 457/1656，2026-11-06）：
+    // 复制技能把执行期技能换成按 id 构造的 Skills，但伤害结算 stage_simple_attack_damage
+    // 在 pending 已消费后只能拿到玩家点选的原技能对象 → STAB 会误用原技能系别（复制技能
+    // 自身多为无系别/0 威力）。这里在 resolve_skill_execution 物化执行技能时写一份
+    // "本次实际执行技能的系别"，伤害公式的 involve 读它；`valid=false` 时回退 skill.element
+    // （普通技能行为逐字节不变）。ws 每回合 reset 天然失效。
+    int  stab_element_override[2][2]{};
+    bool stab_element_override_valid[2]{};
+
     //========== 链首受击快照（GUARD_DETECT 阶段，增伤**之前**）==========
     // 由 core 的默认回调（`install_default_damage_guard_detect`）在伤害管线**第一位**写入：
     // 本次攻击打出的红伤值——**已含暴击与暴击抗性减免，未含任何增伤/减伤**。
@@ -569,7 +605,9 @@ public:
         if (index < 0 || index >= 6) {
             throw std::out_of_range("Index out of range");
         }
-        const int level_eff = (pierce_boost && level[index] > 0) ? 0 : level[index];
+        const int level_eff = (pierce_boost && level[index] > 0)
+            ? 0
+            : ((ignore_level_drop[owner] && level[index] < 0) ? 0 : level[index]);
         // ⚠️ **体力（HP）没有能力等级**：官方能力提升状态只有 6 种（双攻双防速命中），
         //    不含体力。原实现在这里读 `view_levels[owner][5]`，而槽 5 是**命中** →
         //    等价于"体力值被命中等级缩放"，是纯粹的口径错误。

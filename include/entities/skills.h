@@ -217,6 +217,17 @@ public:
     // 执行期主流程：命中/无效判定 → 注册对应分支效果到各时点桶。
     // 返回结果 + resolution flags（FSM 写回 workspace 供后续时点判断）。
     std::pair<SkillExecResult, SkillResolutionFlags> execute(BattleContext* ctx, int owner, State trigger_state);
+    // 星皇之怒二段（术语 406，2026-11-06）：**只重掷命中与暴击**，供额外攻击使用。
+    // 与 query_usage 的区别（刻意）：不走盔/威/封属/命中失效门、不消费拦截次数、不发事件、
+    // 不物化穿透凭证——官方"本次攻击…不会被其他效果响应"。命中返回 true 并写 *crit_out。
+    bool roll_extra_attack(BattleContext* ctx, int owner, bool* crit_out);
+    // 复制技能（457/1656）：把**点选技能自己**的 HIT 分支也注册一遍（执行期已被替换成
+    // 复制技能，但复制技能的"复制者本体效果"——如 1656 的惩罚子句、极致模仿的
+    // 3 回合窗口——仍属于本次使用，必须照常执行）。
+    void register_owned_branches(BattleContext* ctx, int owner, SkillExecResult result,
+                                 const SkillResolutionFlags& flags) {
+        register_branch(ctx, owner, result, flags);
+    }
 
 private:
     // 词条参数覆盖：改 rawEffectRecords 里的 args（arg_index = 模板 {n} 下标）。

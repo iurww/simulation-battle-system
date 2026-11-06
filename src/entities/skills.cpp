@@ -1000,6 +1000,12 @@ SkillUsageResult Skills::query_usage(BattleContext* ctx, int owner) {
         //   （否则盔A被穿→监听器残留→盔B生效时 A/B 都触发，子句多执行一次）；
         //   blocked=false（被穿）时不执行子句——"被穿之后子句自然没有了"。
         [ctx, owner](int source_effect_id, int source_owner, int grant_id, bool blocked) {
+            // 被穿（blocked=false）= 本次技能**确实穿到了**一条攻击免疫/封属条目：
+            // 记进凭证供 2331「无视成功则消除对手回合类效果」判定（2026-11-06）。
+            // ⚠️ 与 `ignore_attack_immunity`（请求携带）区分：请求了但对手没有盔不算成功。
+            if (!blocked && owner >= 0 && owner <= 1) {
+                ctx->ws.attack_credential[owner].pierced_attack_immunity = true;
+            }
             BattleEvent ev{EventType::EVENT_SKILL_ARMOR_RESOLVED, source_owner, owner, source_effect_id};
             ev.grant_id = grant_id;
             ev.blocked = blocked;
@@ -1076,7 +1082,7 @@ SkillUsageResult Skills::query_usage(BattleContext* ctx, int owner) {
     //    消费点收口在本函数末尾（而不是 execute 里各判一次），与 miss/sealed 同一处出结果。
     //    强制执行由 `cred.force_execute` 绕过（在 is_hit_effect_invalid 里判）。
     if (!cred.force_execute) {
-        const std::optional<int> mode = ctx->rule_center_.consume_hit_invalid(1 - owner, is_attribute);
+        const std::optional<int> mode = ctx->rule_center_.consume_hit_invalid(ctx, 1 - owner, is_attribute);
         if (mode.has_value()) {
             ctx->ws.hit_invalid_detected[owner] = true;
             ctx->ws.hit_invalid_mode[owner] = *mode;   // 供伤害路径判 kFullNull（白板归零）
@@ -1108,6 +1114,96 @@ SkillUsageResult Skills::query_usage(BattleContext* ctx, int owner) {
     }
 
     return SkillUsageResult::OK;
+}
+
+// 星皇之怒二段（术语 406，2026-11-06）：**只重掷命中与暴击**。
+// 刻意不走 query_usage：那条路会消费盔/威/封属/命中失效（"被其他效果响应"）并发事件；
+// 二段是"额外进行一次攻击"——重新判命中与暴击，但不作为一次技能使用。
+bool Skills::roll_extra_attack(BattleContext* ctx, int owner, bool* crit_out) {
+    if (crit_out != nullptr) {
+        *crit_out = false;
+    }
+    if (!ctx || owner < 0 || owner > 1) {
+        return false;
+    }
+    const bool is_attribute = (type == SkillType::Attribute);
+    // 命中：必中（技能固有 ∨ 本回合条件必中授予 ∨ 本次凭证）直接过；否则按与 query_usage ① 相同的
+    // 精度链重掷（失明/精准/回避/命中等级/命中率修正/混乱/易燃/闪避）。刻意**不查**盔/威/
+    // 封属/命中失效（那些是"响应"，二段不响应）。
+    const BattleWorkspace::AttackCredential& cred = ctx->ws.attack_credential[owner];
+    const bool must = must_hit || ctx->ws.must_hit_grant[owner] || cred.must_hit
+        || cred.force_execute;
+    if (!must) {
+        if (ctx->has_active_abnormal_status(owner, static_cast<int>(AbnormalStatusId::Blind))) {
+            return false;   // 非必中 + 失明 = 必定 miss
+        }
+        int accuracy = this->accuracy;
+        if (ctx->ws.attack_credential[owner].accuracy_fix_100) {
+            accuracy = 100;
+        }
+        if (const std::optional<EffectiveTrait> p =
+                ctx->effective_common_trait(owner, TraitKind::Precision)) {
+            accuracy = checked_pct_mul(accuracy, p->args[0], "skills 二段精准特性");
+        }
+        if (const std::optional<EffectiveTrait> e =
+                ctx->effective_common_trait(1 - owner, TraitKind::Evasion)) {
+            accuracy = checked_pct_mul(accuracy, -e->args[0], "skills 二段回避特性");
+        }
+        {
+            const int hit_level = ctx->ws.view_levels[owner][kAbilityLevelIndexHit]
+                                + ctx->ws.hit_level_extra[owner];
+            if (hit_level != 0) {
+                accuracy = accuracy * hit_level_accuracy_pct(hit_level) / 100;
+            }
+        }
+        if (ctx->ws.hit_rate_mod[owner] != 1.0f) {
+            accuracy = static_cast<int>(accuracy * ctx->ws.hit_rate_mod[owner]);
+        }
+        if (!is_attribute) {
+            if (ctx->ws.hit_rate_mod_attack[owner] != 1.0f) {
+                accuracy = static_cast<int>(accuracy * ctx->ws.hit_rate_mod_attack[owner]);
+            }
+            if (ctx->has_active_abnormal_status(
+                    owner, static_cast<int>(AbnormalStatusId::Confusion))) {
+                accuracy = accuracy * 20 / 100;
+            }
+            if (ctx->has_active_abnormal_status(
+                    owner, static_cast<int>(AbnormalStatusId::Flammable))) {
+                accuracy = accuracy * 70 / 100;
+            }
+        }
+        const int hit_chance = ctx->ws.attack_credential[owner].accuracy_fix_100
+            ? accuracy
+            : accuracy - static_cast<int>(ctx->ws.dodge_rate[1 - owner] * 100);
+        if ((sbs_rand() % 100) >= hit_chance) {
+            return false;
+        }
+    }
+    if (is_attribute) {
+        return true;   // 属性技能无红伤/无暴击，命中即算"攻击成立"
+    }
+    // 暴击：与 query_usage ①.5 同公式（单独二段重掷，共用 ws 修正视图）。
+    bool crit = ctx->ws.must_crit[owner];
+    if (!crit) {
+        float rate = critical_strike_rate * ctx->ws.crit_rate_mod[owner];
+        rate += ctx->ws.crit_rate_add[owner];
+        if (const std::optional<EffectiveTrait> h =
+                ctx->effective_common_trait(owner, TraitKind::CritBoost)) {
+            if (h->args[0] <= 1) {
+                rate += 6.25f;
+            } else {
+                crit = (sbs_rand() % 10000) < h->args[0] * 10;
+            }
+        }
+        if (!crit) {
+            crit = rate >= 100.0f
+                || (rate > 0.0f && (sbs_rand() % 10000) < static_cast<int>(rate * 100.0f));
+        }
+    }
+    if (crit_out != nullptr) {
+        *crit_out = crit;
+    }
+    return true;
 }
 
 Effect Skills::clone_effect(int effectId, EffectArgs args) const {
@@ -1235,7 +1331,10 @@ std::pair<SkillExecResult, SkillResolutionFlags> Skills::execute(BattleContext* 
     const SkillUsageResult usage = query_usage(ctx, owner);
     if (usage == SkillUsageResult::MISS || usage == SkillUsageResult::SEALED) {
         const SkillResolutionFlags flags = resolution_flags_for(SkillExecResult::SKILL_INVALID);
-        ctx->event_center_.emit(BattleEvent{EventType::EVENT_SKILL_INVALID, owner, ctx->opponent(owner)});
+        BattleEvent invalid_ev{EventType::EVENT_SKILL_INVALID, owner, ctx->opponent(owner)};
+        // grant_id 借作原因码：0=Miss，1=被封属/封攻击/盔挡。160「对手 MISS」据此区分。
+        invalid_ev.grant_id = (usage == SkillUsageResult::MISS) ? 0 : 1;
+        ctx->event_center_.emit(invalid_ev);
         register_branch(ctx, owner, SkillExecResult::SKILL_INVALID, flags);
         // 固有效果（INHERENT）：miss/被封属/盔挡的这趟**照常注册**（用户 2026-09-20 口径）
         register_branch(ctx, owner, SkillExecResult::INHERENT, flags);

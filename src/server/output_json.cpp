@@ -63,6 +63,7 @@ const char* event_type_name(int event_type) {
         case EventType::EVENT_DEATH: return "EVENT_DEATH";
         case EventType::EVENT_CONTROLLED: return "EVENT_CONTROLLED";
         case EventType::EVENT_ANOMALY_APPLIED: return "EVENT_ANOMALY_APPLIED";
+        case EventType::EVENT_ANOMALY_ATTEMPT: return "EVENT_ANOMALY_ATTEMPT";
         case EventType::EVENT_HIT: return "EVENT_HIT";
         case EventType::EVENT_TAKE_DAMAGE: return "EVENT_TAKE_DAMAGE";
         case EventType::EVENT_SHIELD_BROKEN: return "EVENT_SHIELD_BROKEN";
@@ -85,9 +86,13 @@ const char* event_type_name(int event_type) {
         case EventType::EVENT_PP_REDUCED: return "EVENT_PP_REDUCED";
         case EventType::EVENT_BEFORE_SKILL_HIT: return "EVENT_BEFORE_SKILL_HIT";
         case EventType::EVENT_HEAL_RESTORED: return "EVENT_HEAL_RESTORED";
+        case EventType::EVENT_HEAL_BLOCKED: return "EVENT_HEAL_BLOCKED";
         case EventType::EVENT_STAT_REMOVED: return "EVENT_STAT_REMOVED";
         case EventType::EVENT_SKILL_USED: return "EVENT_SKILL_USED";
         case EventType::EVENT_STAT_BOOSTS_LOST: return "EVENT_STAT_BOOSTS_LOST";
+        // 2026-11-06（技能侧第十九轮）：具名护盾的激活/消耗（1691 终阶源盾族）。
+        case EventType::EVENT_SHIELD_GRANTED: return "EVENT_SHIELD_GRANTED";
+        case EventType::EVENT_SHIELD_CONSUMED: return "EVENT_SHIELD_CONSUMED";
     }
     return "EVENT_UNKNOWN";
 }

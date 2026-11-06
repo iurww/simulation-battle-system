@@ -12,6 +12,13 @@ void DamagePipeline::run(BattleContext* ctx, int attacker, int defender, uint32_
         if ((phase_mask & phase_bit(phase)) == 0) {
             continue;   // 该阶段被排除（属性伤害只跑子集，见头文件说明）
         }
+        // 697/750/790「无视伤害限制」：本段 CAP 锁伤整体跳过（凭证在攻击后统一消费）。
+        const bool cap_phase = phase == DamagePhase::CAP;
+        const int cap_before = ctx->ws.resolvedDamage.final;
+        if (cap_phase && attacker >= 0 && attacker <= 1
+            && ctx->ws.attack_credential[attacker].ignore_damage_limit) {
+            continue;
+        }
         // 攻击方先结算，防御方后结算（顺序可随游戏知识调整）
         const int owners[2] = {attacker, defender};
         for (int owner : owners) {
@@ -30,6 +37,9 @@ void DamagePipeline::run(BattleContext* ctx, int attacker, int defender, uint32_
                     effect.fn(ctx, owner);
                 }
             }
+        }
+        if (cap_phase && ctx->ws.resolvedDamage.final < cap_before) {
+            ctx->ws.resolvedDamage.capped = true;
         }
     }
 }
