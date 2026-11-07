@@ -1255,6 +1255,10 @@ State state_for_owner(State state, int owner, const BattleContext* ctx) {
     }
 
     switch (state) {
+        // 命中前：先手/后手各有独立 handler，技能节点必须镜像到 SECOND 侧；
+        // 否则后手方的“先/后手必暴、威力替换”类隐藏规则会挤进 FIRST 桶。
+        case State::BATTLE_FIRST_BEFORE_SKILL_HIT:
+            return State::BATTLE_SECOND_BEFORE_SKILL_HIT;
         case State::BATTLE_FIRST_ON_SKILL_HIT:
             return State::BATTLE_SECOND_ON_SKILL_HIT;
         case State::BATTLE_FIRST_SKILL_EFFECT:
