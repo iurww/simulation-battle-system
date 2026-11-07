@@ -2518,10 +2518,62 @@ void register_death_interceptor(BattleContext* ctx, DeathInterceptor interceptor
     if (!ctx) {
         return;
     }
+    // 2569：注册发生在魂印激活/重触发的调用栈里时，自动登记归属魂印实例 id。
+    // 非魂印上下文保持 0（不会被「取消被击败要求」误触发）。
+    if (interceptor.source_soulmark_id == 0) {
+        interceptor.source_soulmark_id = ctx->registering_soulmark_id;
+    }
     if (interceptor.source_effect_id != 0) {
+        // 同源覆盖是幂等重注册（登场早期节点 + 时点桶都可能各注册一次）。后一次若不在
+        // 魂印调用栈里（registering_soulmark_id==0），沿用旧条目的归属，别把 2569 需要的
+        // source_soulmark_id / trigger_without_defeat 洗掉。
+        for (const DeathInterceptor& old : ctx->death_interceptors) {
+            if (old.source_effect_id != interceptor.source_effect_id) continue;
+            if (old.owner != interceptor.owner) continue;
+            if (interceptor.source_soulmark_id == 0) {
+                interceptor.source_soulmark_id = old.source_soulmark_id;
+            }
+            if (!interceptor.trigger_without_defeat) {
+                interceptor.trigger_without_defeat = old.trigger_without_defeat;
+            }
+            break;
+        }
         remove_death_interceptors(ctx, interceptor.source_effect_id);   // 同源覆盖：幂等重注册
     }
     ctx->death_interceptors.push_back(std::move(interceptor));
+}
+
+int trigger_death_effects_without_defeat(BattleContext* ctx, int side, int slot) {
+    if (!ctx || side < 0 || side > 1 || slot < 0 || slot >= 6) {
+        return 0;
+    }
+    ElfPet& pet = ctx->seerRobot[side].elfPets[slot];
+    if (pet.id < 0 || pet.hp <= 0) {
+        return 0;
+    }
+    // 先快照待触发的拦截器：fn 内部可能注册/注销拦截器（复活/免死族），
+    // 直接遍历 ctx->death_interceptors 会踩迭代器失效。复制 std::function 后再调用。
+    std::vector<DeathInterceptor> pending;
+    for (DeathInterceptor& ic : ctx->death_interceptors) {
+        if (!ic.trigger_without_defeat || !ic.fn) {
+            continue;
+        }
+        if (ic.owner >= 0 && ic.owner != side) {
+            continue;
+        }
+        // 先消费标记（防重入时同一拦截器再被调用）。
+        ic.trigger_without_defeat = false;
+        pending.push_back(ic);
+    }
+    const int saved_hp = pet.hp;
+    const bool saved_notified = ctx->pet_death_notified[side][slot];
+    for (DeathInterceptor& ic : pending) {
+        pet.hp = 1;                     // 「被击败」临界态：让拦截器判定通过
+        ic.fn(ctx, side, slot, /*actor=*/-1, DefeatCause::DAMAGE);
+        pet.hp = saved_hp;              // 不真正死亡、不写复活、不改变当前体力
+        ctx->pet_death_notified[side][slot] = saved_notified;
+    }
+    return static_cast<int>(pending.size());
 }
 
 void remove_death_interceptors(BattleContext* ctx, int source_effect_id) {

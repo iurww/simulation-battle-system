@@ -83,6 +83,9 @@ public:
         , speed_priority(other.speed_priority)
         , shield(other.shield)
         , cover(other.cover)
+        , is_spirit_king(other.is_spirit_king)
+        , has_hp_consume_kit(other.has_hp_consume_kit)
+        , damage_suppress_mask(other.damage_suppress_mask)
         , is_locked(other.is_locked)
         , skills(other.skills)
         , marks(other.marks)
@@ -105,6 +108,9 @@ public:
         , speed_priority(other.speed_priority)
         , shield(other.shield)
         , cover(other.cover)
+        , is_spirit_king(other.is_spirit_king)
+        , has_hp_consume_kit(other.has_hp_consume_kit)
+        , damage_suppress_mask(other.damage_suppress_mask)
         , is_locked(other.is_locked)
         , skills(std::move(other.skills))
         , marks(std::move(other.marks))
@@ -129,6 +135,9 @@ public:
         speed_priority = other.speed_priority;
         shield = other.shield;
         cover = other.cover;
+        is_spirit_king = other.is_spirit_king;
+        has_hp_consume_kit = other.has_hp_consume_kit;
+        damage_suppress_mask = other.damage_suppress_mask;
         is_locked = other.is_locked;
         skills = other.skills;
         marks = other.marks;
@@ -155,6 +164,9 @@ public:
         speed_priority = other.speed_priority;
         shield = other.shield;
         cover = other.cover;
+        is_spirit_king = other.is_spirit_king;
+        has_hp_consume_kit = other.has_hp_consume_kit;
+        damage_suppress_mask = other.damage_suppress_mask;
         is_locked = other.is_locked;
         skills = std::move(other.skills);
         marks = std::move(other.marks);

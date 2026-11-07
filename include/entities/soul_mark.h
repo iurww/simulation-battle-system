@@ -39,6 +39,9 @@ public:
     }
 
     int id = 0;
+    // 官方效果 id（eid）。native 装配时从 SoulmarkInput.eid 写入；老链路/未提供时为 0。
+    // 2553「精灵王专属特性首个提及的标记」优先用它作为标记值（见 recovery.cpp）。
+    int eid = 0;
     std::string name;
     std::string description;
     // 程序链路：多时点节点（trigger_state/once/early 见 plugin_interface.h SoulMarkNodeRef）。

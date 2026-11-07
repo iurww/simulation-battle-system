@@ -1006,6 +1006,20 @@ void register_death_interceptor(BattleContext* ctx, DeathInterceptor interceptor
 /** 注销某来源的全部死亡拦截器（效果失效/被消逝时撤掉自己的那条）。 */
 void remove_death_interceptors(BattleContext* ctx, int source_effect_id);
 
+/**
+ * trigger_death_effects_without_defeat - 不造成真实死亡，执行一次「被击败效果」。
+ *
+ * chosen implementation（2569「自身专属特性中的被击败效果取消被击败要求」）：
+ * 只调用已标记 `trigger_without_defeat` 的拦截器 —— 调用前把目标体力临时置 1
+ * （使拦截器看到「已被击败」的临界状态），调用参数 cause=DefeatCause::DAMAGE
+ * （内核无 NORMAL 枚举，DAMAGE 即普通致死口径），调用后**恢复原体力**并清除标记。
+ * 拦截器返回 true（试图免死/复活）也不改变当前体力，副作用子句（清回合/附加异常等）
+ * 仍会执行；死亡登记位同样原样恢复。
+ *
+ * @return 实际调用的拦截器数量。
+ */
+int trigger_death_effects_without_defeat(BattleContext* ctx, int side, int slot);
+
 // ----------------------------------------------------------------
 // 可上场额外精灵（2026-11-06，2584 瀚宇星皇）
 // ----------------------------------------------------------------

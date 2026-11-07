@@ -438,6 +438,9 @@ void SoulMark::activate_soul_mark(BattleContext* context, int owner, bool owner_
     if (!context || owner < 0 || owner > 1) {
         return;
     }
+    // 2569：让本调用栈内注册的 DeathInterceptor 自动归属本魂印实例。
+    const int prev_registering_soulmark = context->registering_soulmark_id;
+    context->registering_soulmark_id = id;
     // 两条链路都要注册进桶：
     //   程序链路 → 各节点按 trigger_state/scope 注册；
     //   单效果链路（旧）→ 注册到 BATTLE_ROUND_START 每回合执行（原先这一步靠 FSM 的
@@ -460,13 +463,16 @@ void SoulMark::activate_soul_mark(BattleContext* context, int owner, bool owner_
         if (hooks_.on_enter) {
             hooks_.on_enter(context, owner);
         }
+        context->registering_soulmark_id = prev_registering_soulmark;
         return;
     }
     if (!effect) {
+        context->registering_soulmark_id = prev_registering_soulmark;
         return;
     }
     // 单效果链路：除了注册到桶，还立即执行一次（保持原 activate 语义——战斗开始即生效）。
     effect(context, bind_soulmark_args(args, owner, host_slot));
+    context->registering_soulmark_id = prev_registering_soulmark;
 }
 
 // SoulMark::retrigger_entrance — 重触发登场行为（只执行、不重注册）。
@@ -481,6 +487,8 @@ void SoulMark::retrigger_entrance(BattleContext* context, int owner, int host_sl
     if (!has_program_) {
         return;  // 单效果链路没有"登场行为"概念（其效果是每回合注册执行的）
     }
+    const int prev_registering_soulmark = context->registering_soulmark_id;
+    context->registering_soulmark_id = id;
     const bool owner_on_stage = context->on_stage[owner] == host_slot;
     for (const auto& node : program_) {
         if (node.boss_invalid && context->is_boss_challenge) {
@@ -494,6 +502,7 @@ void SoulMark::retrigger_entrance(BattleContext* context, int owner, int host_sl
     if (hooks_.on_enter) {
         hooks_.on_enter(context, owner);
     }
+    context->registering_soulmark_id = prev_registering_soulmark;
 }
 
 void SoulMark::remove_nodes_by_state(BattleContext* context, int owner, State state) {
@@ -519,8 +528,11 @@ void SoulMark::remove_nodes_by_state(BattleContext* context, int owner, State st
 
 void SoulMark::trigger_all_programs(BattleContext* context, int owner, int host_slot) {
     if (!context || owner < 0 || owner > 1 || host_slot < 0 || host_slot > 5) return;
+    const int prev_registering_soulmark = context->registering_soulmark_id;
+    context->registering_soulmark_id = id;
     if (!has_program_) {
         if (effect) effect(context, bind_soulmark_args(args, owner, host_slot));
+        context->registering_soulmark_id = prev_registering_soulmark;
         return;
     }
     for (const auto& node : program_) {
@@ -529,6 +541,7 @@ void SoulMark::trigger_all_programs(BattleContext* context, int owner, int host_
             node.effect_fn(context, bind_soulmark_args(args, owner, host_slot));
         }
     }
+    context->registering_soulmark_id = prev_registering_soulmark;
 }
 
 // SoulMark::deactivate_soul_mark — 离场/阵亡。

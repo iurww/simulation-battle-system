@@ -105,6 +105,15 @@ struct DeathInterceptor {
                                   //   false = 残留体力免死（官方：不能被消耗体力免死）
                                   //   true  = 复活/真2命（官方：触发就可不死）
     std::function<bool(BattleContext*, int side, int slot, int actor, DefeatCause cause)> fn;
+    // ── 2569「取消被击败要求」专用（2026-11-08 chosen implementation）─────────
+    // 需求：对方有秒杀特性时，让 2569 携带者的魂印**被击败效果**不经过真实死亡也执行一次。
+    // 做法：2569 登场时把该精灵魂印注册的拦截器标记为 trigger_without_defeat，再由
+    // trigger_death_effects_without_defeat 以 hp=1 / DefeatCause::DAMAGE 调用一次
+    // （调用后清除标记、恢复原 HP，不写复活）。source_soulmark_id 在注册时由
+    // BattleContext::registering_soulmark_id 自动填充，用于按魂印精确匹配。
+    // 追加在 fn 之后 → 既有 `{source, owner, sees_hp_consume, lambda}` 聚合初始化不受影响。
+    bool trigger_without_defeat = false;
+    int source_soulmark_id = 0;
 };
 
 #endif // SPIRIT_LIFECYCLE_H

@@ -757,6 +757,9 @@ public:
     //    用 DeathInterceptor::sees_hp_consume 区分，见 spirit_lifecycle.h 头注释。
     // clearAllEffects 清空。
     std::vector<DeathInterceptor> death_interceptors;
+    // 当前正在激活/重触发的魂印实例 id（0 = 非魂印上下文）。register_death_interceptor
+    // 据此把拦截器归属到 source_soulmark_id（2569「取消被击败要求」按魂印匹配）。
+    int registering_soulmark_id = 0;
 
     //--- 额外精灵（独立容器，**不进 6 槽数组**）---    // 官方的三个状态 + "不在背包/不在场上/不在场下，只属于不在场"（idx=149）。
     // 代表性来源：魂帝咽咎尸骸（开局即有一条 DEAD 条目——**开局尸体不走死亡钩子**，
