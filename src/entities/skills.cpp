@@ -1402,7 +1402,9 @@ void Skills::register_branch(BattleContext* ctx, int owner, SkillExecResult resu
         // ③层：命中效果失效时跳过可否决节点（逐效果 nullify 标签，非整技能一刀切）
         if (filter_hit_invalid) {
             const EffectMeta* meta = EffectMetaCatalog::instance().find(effect.id);
-            if (meta && meta->nullify.hit_effect_invalidatable) {
+            // 无元数据（native 宿主未加载官方 DB / EffectMetaCatalog 为空）时按
+            // NullifyPolicy 的默认 true 处理：命中效果失效应跳过该条。
+            if (!meta || meta->nullify.hit_effect_invalidatable) {
                 continue;
             }
         }
