@@ -441,6 +441,13 @@ public:
     PendingChargedSkill pending_charged_skill[2];
     int last_charged_release_round[2]{-1, -1};
 
+    // 复制技能构造工厂（native 适配，2026-11-08 批次 05）：SBS 原生路径 `Skills(id)` 要查
+    // 官方 DB（`loadSkills`），本工程的对战宿主直接用 `PetInput/SkillInput` 组装技能、不加载
+    // 该 DB，`Skills(id)` 会抛异常 → 457/1656 的复制永远失败。宿主在构造 context 后注入本
+    // 工厂（按技能 id 返回一份组装好的 Skills，找不到返回 nullptr），复制链路即按真实数据
+    // 执行（威力/系别/类别/命中/效果分支全覆盖）。未注入时保持旧的 `Skills(id)` 行为。
+    std::function<std::unique_ptr<Skills>(int)> copied_skill_factory;
+
     // 安装复制技能并注入执行期替换。返回 false = id 非法/组装失败（回退原技能）。
     // 内联：插件动态库不链接 sim_core（仿 grant_penetration 先例）。
     bool install_copied_skill(int owner, int skill_id, int source_slot) {
@@ -448,7 +455,13 @@ public:
             return false;
         }
         try {
-            auto skill = std::make_unique<Skills>(skill_id);
+            auto skill = copied_skill_factory
+                             ? copied_skill_factory(skill_id)
+                             : std::make_unique<Skills>(skill_id);
+            if (!skill) {
+                pending_skill_replacement[owner] = SkillReplaceSource{};
+                return false;
+            }
             copied_skill_for_use[owner] = std::move(skill);
         } catch (...) {
             copied_skill_for_use[owner].reset();
