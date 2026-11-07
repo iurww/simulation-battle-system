@@ -92,6 +92,12 @@ public:
     // 触发该魂印的全部程序节点（2463“阶段结束未用技能→触发自身专属特性所有效果”）。
     void trigger_all_programs(BattleContext* context, int owner, int host_slot);
 
+    // 按触发时点移除程序节点（2395“每次登场时移除专属特性中的『回合开始时』”）。
+    // ① 从 program_ 删除 trigger_state == state 的节点（之后 activate/updater 重注册不会再生成）；
+    // ② 若给 context/owner，同时把已注册到该时点桶的**本源**（source_id_ == id）条目移除，
+    //    使“本次登场已经注册”的节点也立刻失效。必须在非该魂印桶执行栈内调用（2395 在技能桶）。
+    void remove_nodes_by_state(BattleContext* context, int owner, State state);
+
     // 在更新器桶登记"每回合刷新本魂印节点"的对象（回合边界执行，刷新 once 效果）。
     // 登场时调用一次即可（条目 source_id 去重，重复调用幂等）。
     void register_updater(BattleContext* context, int owner);

@@ -496,6 +496,27 @@ void SoulMark::retrigger_entrance(BattleContext* context, int owner, int host_sl
     }
 }
 
+void SoulMark::remove_nodes_by_state(BattleContext* context, int owner, State state) {
+    program_.erase(std::remove_if(program_.begin(), program_.end(),
+                                  [state](const SoulMarkNodeRef& node) {
+                                      return node.trigger_state == state;
+                                  }),
+                   program_.end());
+    // 窗界锚点按 node_idx 记账；删节点后索引整体前移，直接清空最稳妥（再上场重开窗）。
+    window_anchor_round_.clear();
+    if (context == nullptr || owner < 0 || owner > 1 || id <= 0) {
+        return;
+    }
+    TimedEffectMap& effects = context->soul_mark_effects.at(state, owner);
+    for (auto it = effects.begin(); it != effects.end();) {
+        if (it->second != nullptr && it->second->source_id_ == id) {
+            it = effects.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void SoulMark::trigger_all_programs(BattleContext* context, int owner, int host_slot) {
     if (!context || owner < 0 || owner > 1 || host_slot < 0 || host_slot > 5) return;
     if (!has_program_) {

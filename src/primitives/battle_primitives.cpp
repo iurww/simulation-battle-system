@@ -242,6 +242,7 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
     // ⚠️ 通道无关：三个通道（Modern/Ancient/Raw）都过这一步。亮节原文点名覆盖"主动毒、
     //    被动毒"，而它们正是 Ancient/Raw 通道——闸门在这里是**比免疫链更外层**的东西
     //    （问的是"这次附加到底有没有发生"，不是"发生了会不会被挡"）。
+    int final_pct = -1;   // -1 = 本次不掷骰（未申报且无动态覆盖）
     if (chance_pct >= 0) {
         int declared = chance_pct;
         if (actor >= 0 && actor <= 1 && ctx->anomaly_chance_add[actor] != 0
@@ -257,9 +258,28 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
         BattleEvent attempt{EventType::EVENT_ANOMALY_ATTEMPT, actor, target, anomaly_id};
         attempt.stat_index = declared;
         ctx->event_center_.emit(attempt);
-        const int final_pct = ctx->rule_center_.rewrite_anomaly_chance(
+        final_pct = ctx->rule_center_.rewrite_anomaly_chance(
             target, actor, declared, ChanceTag::AnomalyAttach, source, ctx->roundCount,
             anomaly_id);
+    }
+    // [2.3] **施加方动态概率覆盖**（2559 混沌魔眼，2026-11-08）：
+    // 申报/未申报都问一次；返回 <0 不接管，0 = 必定失败，>=100 = 必定成功。
+    // 未申报时也覆盖，是为了让“之后概率 0%”能压住“本来必定附加”的单点施加。
+    if (actor >= 0 && actor <= 1 && ctx->anomaly_chance_override[actor] != nullptr) {
+        const int base = final_pct >= 0 ? final_pct : (chance_pct >= 0 ? chance_pct : 100);
+        const int overridden = ctx->anomaly_chance_override[actor](
+            ctx, actor, target, anomaly_id, base);
+        if (overridden >= 0) {
+            if (final_pct < 0) {
+                BattleEvent attempt{EventType::EVENT_ANOMALY_ATTEMPT, actor, target,
+                                    anomaly_id};
+                attempt.stat_index = overridden;
+                ctx->event_center_.emit(attempt);
+            }
+            final_pct = overridden;
+        }
+    }
+    if (final_pct >= 0) {
         if (final_pct <= 0) {
             return ApplyAnomalyResult::ROLL_FAILED;
         }
@@ -361,8 +381,17 @@ static ApplyAnomalyResult apply_anomaly_impl(BattleContext* ctx,
             }
         }
         if (resisted) {
-        const int resolved = resolve_anomaly_conversion(
+        int resolved = resolve_anomaly_conversion(
             ctx, target, static_cast<int>(AbnormalStatusId::AbnormalImmunity));
+        // 抗性结果转化器（2463 缚神结界）：把“免疫异常(21)”替换为指定异常（诅咒）。
+        // 在写入状态之前调用，实现方可在回调里扣减“非唯一最高项”抗性。
+        if (ctx->anomaly_resist_convert[target] != nullptr) {
+            const int converted = ctx->anomaly_resist_convert[target](
+                ctx, target, actor, anomaly_id);
+            if (converted > 0 && is_valid_abnormal_status_id(converted)) {
+                resolved = converted;
+            }
+        }
         ctx->set_abnormal_status_end_round(target, resolved, ctx->roundCount + 2);
         emit_anomaly_events(ctx, target, resolved, actor);
         // 抗性触发专属事件（套装线 2026-09-19 圣芒佑界 476"异常抗性触发时回血"用）：
@@ -518,8 +547,10 @@ RandomAnomalyResult attach_random_anomalies(BattleContext* ctx,
                                             int actor,
                                             ChanceSource source) {
     RandomAnomalyResult out;
-    if (!ctx || target < 0 || target > 1 || count <= 0 || probability_pct <= 0
-        || base_pool.empty()) {
+    const int count_mod = (ctx != nullptr && actor >= 0 && actor <= 1)
+                              ? ctx->anomaly_count_mod[actor] : 0;
+    if (!ctx || target < 0 || target > 1 || (count <= 0 && count_mod <= 0)
+        || probability_pct <= 0 || base_pool.empty()) {
         return out;
     }
     // ① 解析池（⊕池改写票，授予序折叠 + 去重保序——都在 resolve_anomaly_pool 里）。
@@ -527,7 +558,11 @@ RandomAnomalyResult attach_random_anomalies(BattleContext* ctx,
     if (pool.empty()) {
         return out;
     }
-    out.requested = std::min(count, static_cast<int>(pool.size()));
+    // ①' 种数改写（2561 堕灵神谕：随机附加的种数 +1，按施加方）。
+    int requested = count;
+    if (actor >= 0 && actor <= 1) requested += ctx->anomaly_count_mod[actor];
+    requested = std::max(0, requested);
+    out.requested = std::min(requested, static_cast<int>(pool.size()));
     // ② 概率门：整个子句一次（同插件侧 roll_percent 语义：<100 时 sbs_rand()%100 判定）。
     // ⚠️ 掷骰**之前**先过闸门（亮节族）——与三个施加原语的 chance_pct 是同一道门。
     //    这是"整子句一次"的那次判定，故闸门在这里问；③ 里的逐只 apply_anomaly 传 -1

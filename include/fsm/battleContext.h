@@ -837,6 +837,29 @@ public:
     int anomaly_chance_add_status[2]{-1, -1};
     int anomaly_resist_ignore_pct[2]{};
 
+    //--- 施加方按异常种类的动态概率覆盖（2559 混沌魔眼，2026-11-08）---
+    // 与上面的一次性 anomaly_chance_add 不同：本钩子由施加方长期持有，**每次**
+    // apply_anomaly 的 chance 判定前都会被问（申报/未申报概率都问）。返回 <0 = 不接管；
+    // 0 = 必定失败；>=100 = 必定成功；其余 = 以该百分点掷骰。实现方自己维护
+    // “首次/之后/受击重置”等状态（2559 的 100%→0%→受击重置）。
+    // 放在 chance_add 之后：一次性加成先结算，本钩子做最终覆盖。
+    using AnomalyChanceOverrideFn = int (*)(BattleContext* ctx, int actor, int target,
+                                            int anomaly_id, int declared);
+    AnomalyChanceOverrideFn anomaly_chance_override[2]{nullptr, nullptr};
+
+    //--- 随机异常附加种数改写（2561 堕灵神谕：随机附加种数 +1，2026-11-08）---
+    // attach_random_anomalies 在解析池后把 requested 加上本值（按施加方），再钳到池大小。
+    int anomaly_count_mod[2]{};
+
+    //--- 抗性成功结果转化器（2463 缚神结界，2026-11-08）---
+    // 目标方异常抗性判定成功时，apply_anomaly 在写入“免疫异常(21)”之前询问本钩子：
+    // 返回 >0 的有效异常 id = 把抗性结果替换为该异常（仍算抗性触发，照发 RESISTED）；
+    // 返回 <=0 或未注册 = 保持原行为（21）。钩子可顺带修改 ResistanceSystem
+    // （2463 的“每触发 1 次该项抗性 -10%”）。
+    using AnomalyResistConvertFn = int (*)(BattleContext* ctx, int target, int actor,
+                                           int incoming);
+    AnomalyResistConvertFn anomaly_resist_convert[2]{nullptr, nullptr};
+
     //--- 技能效果执行表 ---
     // TimedBucket 封装：注册/同源去重/时点执行/过期清理/epoch 作废/回合计数（见 effects/timed_bucket.h）。
     // 内层 key = (source_id << 32) | effect_id，同源同 effect 新注册自动覆盖旧。
