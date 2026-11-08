@@ -17,6 +17,29 @@
 
 #include <algorithm>
 #include <iostream>
+#include <optional>
+
+namespace {
+
+// 本项目 PvP 固定六种药剂的内置目录。
+// 原生对战进程不加载 SBS 的官方 SQLite（battle_items 表），这里只做该表的兜底：
+// 同 id 的官方记录存在时仍优先使用官方记录。数量/上限由调用方库存决定。
+std::optional<official_data::BattleItemRecord> builtin_pvp_medicine(int item_id) {
+    official_data::BattleItemRecord r;
+    r.item_id = item_id;
+    r.max_count = 999;
+    switch (item_id) {
+        case 300016: r.name = "初级活力药剂"; r.pp = 5; return r;
+        case 300017: r.name = "中级活力药剂"; r.pp = 10; return r;
+        case 300018: r.name = "高级活力药剂"; r.pp = 20; return r;
+        case 300071: r.name = "巅峰体力药剂"; r.hp = 200; return r;
+        case 300072: r.name = "极限体力药剂"; r.hp = 250; return r;
+        case 300751: r.name = "雷诺的急救包"; r.hp = 330; r.max_count = 5; return r;
+        default: return std::nullopt;
+    }
+}
+
+}  // namespace
 
 bool SeerRobot::use_medicine(BattleContext* ctx, int robot_id, int item_id) {
     if (!ctx || robot_id < 0 || robot_id > 1) {
@@ -33,8 +56,10 @@ bool SeerRobot::use_medicine(BattleContext* ctx, int robot_id, int item_id) {
     if (pet.hp <= 0 || ctx->is_death_registered(robot_id, ctx->on_stage[robot_id])) {
         return false;
     }
-    auto record = official_data::OfficialDataStore::instance().repository().load_battle_item(item_id);
-    if (!record) {
+    auto official = official_data::OfficialDataStore::instance().repository().load_battle_item(item_id);
+    auto builtin = builtin_pvp_medicine(item_id);
+    const official_data::BattleItemRecord* record = official ? &*official : (builtin ? &*builtin : nullptr);
+    if (record == nullptr) {
         std::cerr << "Unknown battle item: " << item_id << " (not in battle_items)" << std::endl;
         return false;
     }
